@@ -5,7 +5,7 @@
     "model": "Qwen/Qwen2.5-VL-7B-Instruct",
     "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",
     "dataset_name": "sharegpt",
-    "num_of_req": 500,
+    "num_of_req": 200000,
     "max_concurrent": 1000,
     "request_rate": 2000,
     "request_distribution": ["poisson", 2000],
