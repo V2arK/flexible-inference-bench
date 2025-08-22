@@ -1,0 +1,17 @@
+{
+    "backend": "cserve-chat",
+    "base_url": "https://honglintest.d691afed.c-09.centml.com",
+    "endpoint": "openai/v1/chat/completions",
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "dataset_name": "sharegpt",
+    "num_of_req": 200,
+    "max_concurrent": 25,
+    "request_rate": 50,
+    "request_distribution": ["poisson", 50],
+
+    "temperature": 0.0,
+    "disable_stream": false,
+    "num_validation_reqs": 5,
+    "output_file": "concurrency-high-results.json"
+}
