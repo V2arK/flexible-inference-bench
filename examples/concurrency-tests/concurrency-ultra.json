@@ -13,6 +13,5 @@
     "temperature": 0.0,
     "disable_stream": false,
     "num_validation_reqs": 5,
-    "max_time_for_reqs": 180,
     "output_file": "concurrency-ultra-results.json"
 }
