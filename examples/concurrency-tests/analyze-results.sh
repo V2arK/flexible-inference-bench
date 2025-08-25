@@ -98,7 +98,8 @@ get_concurrency_level() {
 declare -a CONCURRENCY_LEVELS=()
 declare -a MEAN_TTFT=()
 declare -a P99_TTFT=()
-declare -a THROUGHPUT=()
+declare -a INPUT_TOKEN_THROUGHPUT=()
+declare -a OUTPUT_TOKEN_THROUGHPUT=()
 declare -a MEAN_TPOT=()
 declare -a P99_TPOT=()
 declare -a MEAN_ITL=()
@@ -126,11 +127,12 @@ analyze_file() {
         if [ -f "$output_file" ]; then
             req_count=$(grep "Successful requests:" "$output_file" | awk '{print $3}' || echo "N/A")
             duration=$(grep "Benchmark duration" "$output_file" | awk '{print $4}' || echo "N/A")
-            throughput=$(grep "Request throughput" "$output_file" | awk '{print $4}' || echo "N/A")
+            input_throughput=$(grep "Input token throughput" "$output_file" | awk '{print $5}' || echo "N/A")
+            output_throughput=$(grep "Output token throughput" "$output_file" | awk '{print $5}' || echo "N/A")
             mean_ttft=$(grep "Mean TTFT" "$output_file" | awk '{print $4}' || echo "N/A")
             
             echo "  📈 Quick Summary:"
-            echo "     Requests: $req_count | Duration: ${duration}s | Throughput: ${throughput} req/s | TTFT: ${mean_ttft}ms"
+            echo "     Requests: $req_count | Duration: ${duration}s | Input: ${input_throughput} tok/s | Output: ${output_throughput} tok/s | TTFT: ${mean_ttft}ms"
             
             # Extract all metrics for JSON output
             local concurrency_level=$(get_concurrency_level "$test_name")
@@ -145,7 +147,8 @@ analyze_file() {
                 CONCURRENCY_LEVELS+=("$concurrency_level")
                 MEAN_TTFT+=("$mean_ttft")
                 P99_TTFT+=("$p99_ttft")
-                THROUGHPUT+=("$throughput")
+                INPUT_TOKEN_THROUGHPUT+=("$input_throughput")
+                OUTPUT_TOKEN_THROUGHPUT+=("$output_throughput")
                 MEAN_TPOT+=("$mean_tpot")
                 P99_TPOT+=("$p99_tpot")
                 MEAN_ITL+=("$mean_itl")
@@ -192,7 +195,8 @@ sort_metrics_by_concurrency() {
     local new_concurrency=()
     local new_mean_ttft=()
     local new_p99_ttft=()
-    local new_throughput=()
+    local new_input_throughput=()
+    local new_output_throughput=()
     local new_mean_tpot=()
     local new_p99_tpot=()
     local new_mean_itl=()
@@ -204,7 +208,8 @@ sort_metrics_by_concurrency() {
         new_concurrency+=("${CONCURRENCY_LEVELS[$idx]}")
         new_mean_ttft+=("${MEAN_TTFT[$idx]}")
         new_p99_ttft+=("${P99_TTFT[$idx]}")
-        new_throughput+=("${THROUGHPUT[$idx]}")
+        new_input_throughput+=("${INPUT_TOKEN_THROUGHPUT[$idx]}")
+        new_output_throughput+=("${OUTPUT_TOKEN_THROUGHPUT[$idx]}")
         new_mean_tpot+=("${MEAN_TPOT[$idx]}")
         new_p99_tpot+=("${P99_TPOT[$idx]}")
         new_mean_itl+=("${MEAN_ITL[$idx]}")
@@ -217,7 +222,8 @@ sort_metrics_by_concurrency() {
     CONCURRENCY_LEVELS=("${new_concurrency[@]}")
     MEAN_TTFT=("${new_mean_ttft[@]}")
     P99_TTFT=("${new_p99_ttft[@]}")
-    THROUGHPUT=("${new_throughput[@]}")
+    INPUT_TOKEN_THROUGHPUT=("${new_input_throughput[@]}")
+    OUTPUT_TOKEN_THROUGHPUT=("${new_output_throughput[@]}")
     MEAN_TPOT=("${new_mean_tpot[@]}")
     P99_TPOT=("${new_p99_tpot[@]}")
     MEAN_ITL=("${new_mean_itl[@]}")
@@ -275,7 +281,9 @@ EOF
         echo "," >> "$json_file"
         generate_metric_array "p99_ttft" "P99_TTFT"  
         echo "," >> "$json_file"
-        generate_metric_array "throughput" "THROUGHPUT"
+        generate_metric_array "input_token_throughput" "INPUT_TOKEN_THROUGHPUT"
+        echo "," >> "$json_file"
+        generate_metric_array "output_token_throughput" "OUTPUT_TOKEN_THROUGHPUT"
         echo "," >> "$json_file"
         generate_metric_array "mean_tpot" "MEAN_TPOT"
         echo "," >> "$json_file"
@@ -328,13 +336,15 @@ for json_file in $JSON_FILES; do
         # Extract key metrics
         req_count=$(grep "Successful requests:" "$output_file" | awk '{print $3}' 2>/dev/null || echo "N/A")
         duration=$(grep "Benchmark duration" "$output_file" | awk '{print $4}' 2>/dev/null || echo "N/A")
-        throughput=$(grep "Request throughput" "$output_file" | awk '{print $4}' 2>/dev/null || echo "N/A")
+        input_throughput=$(grep "Input token throughput" "$output_file" | awk '{print $5}' 2>/dev/null || echo "N/A")
+        output_throughput=$(grep "Output token throughput" "$output_file" | awk '{print $5}' 2>/dev/null || echo "N/A")
         mean_ttft=$(grep "Mean TTFT" "$output_file" | awk '{print $4}' 2>/dev/null || echo "N/A")
         p99_ttft=$(grep "P99 TTFT" "$output_file" | awk '{print $4}' 2>/dev/null || echo "N/A")
         
         echo "- **Successful Requests**: $req_count" >> "$SUMMARY_FILE"
         echo "- **Duration**: ${duration}s" >> "$SUMMARY_FILE"
-        echo "- **Throughput**: ${throughput} req/s" >> "$SUMMARY_FILE"
+        echo "- **Input Token Throughput**: ${input_throughput} tok/s" >> "$SUMMARY_FILE"
+        echo "- **Output Token Throughput**: ${output_throughput} tok/s" >> "$SUMMARY_FILE"
         echo "- **Mean TTFT**: ${mean_ttft}ms" >> "$SUMMARY_FILE"
         echo "- **P99 TTFT**: ${p99_ttft}ms" >> "$SUMMARY_FILE"
         echo "" >> "$SUMMARY_FILE"
