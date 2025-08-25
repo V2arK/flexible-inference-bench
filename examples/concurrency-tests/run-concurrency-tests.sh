@@ -1,14 +1,54 @@
 #!/bin/bash
 
-# CentML Platform Extended Concurrency Test Suite (4 Replicas)
+# CentML Platform Extended Concurrency Test Suite
 # This script runs comprehensive concurrency tests from low to extreme levels
+# Usage: ./run-concurrency-tests.sh <endpoint_url> <model_name> [test_suite]
 
 set -e
 
+# Function to display usage
+usage() {
+    echo "Usage: $0 <endpoint_url> <model_name> [test_suite]"
+    echo ""
+    echo "Parameters:"
+    echo "  endpoint_url    Base URL for the inference endpoint (e.g., https://api.example.com)"
+    echo "  model_name      Model name to test (e.g., Qwen/Qwen2.5-VL-7B-Instruct)"
+    echo "  test_suite      Optional test suite to run (default: full)"
+    echo ""
+    echo "Test suite options:"
+    echo "  1/basic     - Basic Suite (Low → High)"
+    echo "  2/standard  - Standard Suite (Low → Stress)" 
+    echo "  3/extended  - Extended Suite (Low → Maximum)"
+    echo "  4/full      - Full Suite (All tests including Peak/Burst)"
+    echo "  5/high-load - High-Load Only (Ultra → Burst)"
+    echo "  <test>.json - Single test file"
+    echo ""
+    echo "Examples:"
+    echo "  $0 https://api.centml.com/v1 microsoft/DialoGPT-medium"
+    echo "  $0 https://honglintest.d691afed.c-09.centml.com Qwen/Qwen2.5-VL-7B-Instruct basic"
+    exit 1
+}
+
+# Check if required parameters are provided
+if [ $# -lt 2 ]; then
+    echo "Error: Missing required parameters"
+    echo ""
+    usage
+fi
+
+# Parse command line arguments
+ENDPOINT_URL="$1"
+MODEL_NAME="$2"
+TEST_SUITE="${3:-full}"
+
+# Clean model name for directory (replace / with _)
+MODEL_DIR_NAME=$(echo "$MODEL_NAME" | sed 's/\//_/g')
+
 echo "=== CentML Platform Extended Concurrency Test Suite ==="
-echo "Optimized for 4-replica deployment"
-echo "Testing backend: https://honglintest.d691afed.c-09.centml.com"
-echo "Model: Qwen/Qwen2.5-VL-7B-Instruct"
+echo "Testing backend: $ENDPOINT_URL"
+echo "Model: $MODEL_NAME"
+echo "Test Suite: $TEST_SUITE"
+echo "Results will be saved to: concurrency-test-results-$MODEL_DIR_NAME/"
 echo ""
 
 echo -e "${YELLOW}📝 Timestamp Logging for Manual API Data Collection:${NC}"
@@ -19,9 +59,10 @@ echo ""
 echo -e "${GREEN}✅ Test timestamps will be logged for manual API data collection${NC}"
 echo ""
 
-# Create results directory
-mkdir -p concurrency-test-results
-cd concurrency-test-results
+# Create model-specific results directory
+RESULTS_DIR="concurrency-test-results-$MODEL_DIR_NAME"
+mkdir -p "$RESULTS_DIR"
+cd "$RESULTS_DIR"
 
 # Colors for output
 RED='\033[0;31m'
@@ -29,6 +70,27 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
+
+# Function to create temporary config file with dynamic parameters
+create_temp_config() {
+    local original_config=$1
+    local temp_config="temp_$original_config"
+    
+    # Copy original config and modify it
+    cp "../$original_config" "$temp_config"
+    
+    # Update base_url and model using sed (handling JSON properly)
+    sed -i.bak \
+        -e "s|\"base_url\": \"[^\"]*\"|\"base_url\": \"$ENDPOINT_URL\"|g" \
+        -e "s|\"model\": \"[^\"]*\"|\"model\": \"$MODEL_NAME\"|g" \
+        -e "s|\"tokenizer\": \"[^\"]*\"|\"tokenizer\": \"$MODEL_NAME\"|g" \
+        "$temp_config"
+    
+    # Remove backup file
+    rm -f "${temp_config}.bak"
+    
+    echo "$temp_config"
+}
 
 # Metrics to collect for single-replica comparison
 BASELINE_METRICS=(
@@ -97,9 +159,9 @@ generate_comparison_summary() {
 Generated: $(date)
 
 ## Test Configuration
-- **4-Replica Deployment**: https://honglintest.d691afed.c-09.centml.com
-- **Single Replica Baseline**: Deployment ID $SINGLE_REPLICA_DEPLOYMENT_ID
-- **Model**: Qwen/Qwen2.5-VL-7B-Instruct
+- **Endpoint**: $ENDPOINT_URL
+- **Model**: $MODEL_NAME
+- **Results Directory**: $RESULTS_DIR
 
 ## Data Files
 
@@ -226,23 +288,31 @@ run_test() {
     echo -e "${BLUE}--- Running $test_name ---${NC}"
     echo "Max Concurrent: $concurrent_limit | Target RPS: $rps_limit"
     echo "Configuration: $config_file"
+    echo "Endpoint: $ENDPOINT_URL"
+    echo "Model: $MODEL_NAME"
     
     if [ ! -z "$warning_msg" ]; then
         echo -e "${YELLOW}⚠️  WARNING: $warning_msg${NC}"
         echo "Continuing automatically..."
     fi
     
+    # Create temporary config file with dynamic parameters
+    local temp_config=$(create_temp_config "$config_file")
+    echo "Using temporary config: $temp_config"
+    
     # Capture start time for baseline data collection
     local test_start_time=$(get_timestamp)
     
     # Run benchmark
     echo -e "${GREEN}🚀 Starting test...${NC}"
-    if fib benchmark --config-file "../$config_file"; then
+    if fib benchmark --config-file "$temp_config"; then
         echo -e "${GREEN}✅ Test completed successfully${NC}"
     else
         echo -e "${RED}❌ Test failed or encountered errors${NC}"
         echo "Check the logs above for details"
         echo ""
+        # Clean up temp config on failure
+        rm -f "$temp_config"
         return
     fi
     
@@ -250,7 +320,7 @@ run_test() {
     local test_end_time=$(get_timestamp)
     
     # Analyze results if output file exists
-    local output_file=$(grep '"output_file"' "../$config_file" | cut -d'"' -f4)
+    local output_file=$(grep '"output_file"' "$temp_config" | cut -d'"' -f4)
     if [ -f "$output_file" ]; then
         echo ""
         echo -e "${BLUE}📊 Results for $test_name:${NC}"
@@ -262,6 +332,9 @@ run_test() {
     
     # Log test timestamps for manual API data collection
     log_test_timestamps "$test_start_time" "$test_end_time" "$test_name"
+    
+    # Clean up temporary config file
+    rm -f "$temp_config"
     
     # Small delay between tests
     sleep 3
@@ -333,37 +406,22 @@ run_single_test() {
     run_test "$test_name"
 }
 
-# Auto-run mode - check for command line argument
-if [ $# -eq 0 ]; then
-    echo "No arguments provided. Running Full Suite automatically..."
-    echo ""
-    run_full_suite
-else
-    case $1 in
-        1|basic) run_basic_suite ;;
-        2|standard) run_standard_suite ;;
-        3|extended) run_extended_suite ;;
-        4|full) run_full_suite ;;
-        5|high-load) run_high_load_only ;;
-        *.json) 
-            run_single_test "$1"
-            ;;
-        *) 
-            echo "Usage: $0 [suite-type|test-file.json]"
-            echo ""
-            echo "Suite types:"
-            echo "  1/basic     - Basic Suite (Low → High)"
-            echo "  2/standard  - Standard Suite (Low → Stress)"
-            echo "  3/extended  - Extended Suite (Low → Maximum)"
-            echo "  4/full      - Full Suite (All tests including Peak/Burst)"
-            echo "  5/high-load - High-Load Only (Ultra → Burst)"
-            echo ""
-            echo "Single test files:"
-            echo "  concurrency-low.json, concurrency-medium.json, etc."
-            exit 1
-            ;;
-    esac
-fi
+# Run the specified test suite
+case $TEST_SUITE in
+    1|basic) run_basic_suite ;;
+    2|standard) run_standard_suite ;;
+    3|extended) run_extended_suite ;;
+    4|full) run_full_suite ;;
+    5|high-load) run_high_load_only ;;
+    *.json) 
+        run_single_test "$TEST_SUITE"
+        ;;
+    *) 
+        echo "Error: Invalid test suite '$TEST_SUITE'"
+        echo ""
+        usage
+        ;;
+esac
 
 echo ""
 echo -e "${BLUE}=== Test Suite Operations Complete ===${NC}"
@@ -374,12 +432,13 @@ generate_comparison_summary
 
 echo ""
 echo "=== Final Notes ==="
-echo "All results saved in: concurrency-test-results/"
+echo "All results saved in: $RESULTS_DIR/"
+echo "Tested endpoint: $ENDPOINT_URL"
+echo "Tested model: $MODEL_NAME"
 echo ""
 if [ -f "test-timestamps.log" ]; then
     echo "📊 Test timestamps logged in: test-timestamps.log (CSV format)"
     echo "   - Contains precise start/end times for each test"
-    echo "   - Deployment ID for single-replica data: $SINGLE_REPLICA_DEPLOYMENT_ID"  
     echo "   - Metrics to collect: ${BASELINE_METRICS[*]}"
     echo ""
 fi
