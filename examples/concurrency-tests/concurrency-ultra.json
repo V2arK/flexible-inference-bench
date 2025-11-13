@@ -1,0 +1,18 @@
+{
+    "backend": "vllm",
+    "base_url": "http://10.28.115.40:8000",
+    "endpoint": "/v1/completions",
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "seed": 123123,
+    "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "dataset_name": "sharegpt",
+    "num_of_req": 15000,
+    "max_concurrent": 150,
+    "request_rate": 300,
+    "request_distribution": ["poisson", 300],
+
+    "temperature": 0.0,
+    "disable_stream": false,
+    "num_validation_reqs": 5,
+    "output_file": "concurrency-ultra-results.json"
+}
