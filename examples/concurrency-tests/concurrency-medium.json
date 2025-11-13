@@ -1,8 +1,9 @@
 {
-    "backend": "cserve-chat",
-    "base_url": "https://honglintest.d691afed.c-09.centml.com",
-    "endpoint": "openai/v1/chat/completions",
+    "backend": "vllm",
+    "base_url": "http://10.28.115.40:8000",
+    "endpoint": "/v1/completions",
     "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "seed": 123123,
     "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",
     "dataset_name": "sharegpt",
     "num_of_req": 1250,
