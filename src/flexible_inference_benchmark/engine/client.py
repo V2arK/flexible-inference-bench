@@ -49,6 +49,7 @@ class Client:
         disable_thinking: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         include_schema_in_prompt: bool = False,
+        force_new_grpc_connection: bool = False,
     ):
         self.backend = backend
         self.api_url = api_url
@@ -76,6 +77,7 @@ class Client:
         self.disable_thinking = disable_thinking
         self.json_schema = json_schema
         self.include_schema_in_prompt = include_schema_in_prompt
+        self.force_new_grpc_connection = force_new_grpc_connection
 
     @property
     def request_func(
@@ -193,6 +195,7 @@ class Client:
                 disable_thinking=self.disable_thinking,
                 json_schema=self.json_schema,
                 include_schema_in_prompt=self.include_schema_in_prompt,
+                force_new_grpc_connection=self.force_new_grpc_connection,
             )
             for (data_sample, media_sample) in zip(data, requests_media)
         ]
@@ -242,6 +245,7 @@ class Client:
             disable_thinking=self.disable_thinking,
             json_schema=self.json_schema,
             include_schema_in_prompt=self.include_schema_in_prompt,
+            force_new_grpc_connection=self.force_new_grpc_connection,
         )
         return await self.send_request(-1, data, 0, None, None)
 
@@ -269,6 +273,7 @@ class Client:
             disable_thinking=self.disable_thinking,
             json_schema=self.json_schema,
             include_schema_in_prompt=self.include_schema_in_prompt,
+            force_new_grpc_connection=self.force_new_grpc_connection,
         )
         return await self.signal_profiler(0, data, 0, None, None)
 
@@ -296,5 +301,6 @@ class Client:
             disable_thinking=self.disable_thinking,
             json_schema=self.json_schema,
             include_schema_in_prompt=self.include_schema_in_prompt,
+            force_new_grpc_connection=self.force_new_grpc_connection,
         )
         return await self.signal_profiler(0, data, 0, None, None)

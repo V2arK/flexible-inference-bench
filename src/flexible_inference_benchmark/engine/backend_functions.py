@@ -54,6 +54,7 @@ class RequestFuncInput(BaseModel):
     disable_thinking: bool = False
     json_schema: Optional[Dict[str, Any]] = None
     include_schema_in_prompt: bool = False
+    force_new_grpc_connection: bool = False
 
 
 class RequestFuncOutput(BaseModel):
@@ -87,8 +88,16 @@ def _normalize_grpc_target(api_url: str) -> str:
     return f"{host}:{port}"
 
 
-async def _get_grpc_stub(api_url: str) -> openai_pb2_grpc.VLLMServiceStub:
+async def _get_grpc_stub(api_url: str, force_new_connection: bool = False) -> openai_pb2_grpc.VLLMServiceStub:
     target = _normalize_grpc_target(api_url)
+    
+    if force_new_connection:
+        channel = grpc.aio.insecure_channel(target)
+        # We don't wait for channel ready here to avoid overhead, trusting gRPC to connect.
+        # Also we don't cache it.
+        stub = openai_pb2_grpc.VLLMServiceStub(channel)
+        return stub
+
     loop = asyncio.get_running_loop()
     key = (target, id(loop))
     async with _GRPC_STUB_LOCK:
@@ -726,7 +735,6 @@ async def async_request_openai_chat_completions(
 
 
 
-
 async def async_request_openai_grpc_completions(
     idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
 ) -> RequestFuncOutput:
@@ -742,7 +750,7 @@ async def async_request_openai_grpc_completions(
         print_verbose(idx, request_func_input, st, 0, 0, True)
 
     try:
-        stub = await _get_grpc_stub(request_func_input.api_url)
+        stub = await _get_grpc_stub(request_func_input.api_url, request_func_input.force_new_grpc_connection)
         if request_func_input.stream:
             stream = stub.CompletionStream(request_proto)
             async for chunk in stream:
@@ -817,7 +825,7 @@ async def async_request_openai_grpc_chat_completions(
         print_verbose(idx, request_func_input, st, 0, 0, True)
 
     try:
-        stub = await _get_grpc_stub(request_func_input.api_url)
+        stub = await _get_grpc_stub(request_func_input.api_url, request_func_input.force_new_grpc_connection)
         if request_func_input.stream:
             stream = stub.ChatCompletionStream(request_proto)
             async for chunk in stream:
