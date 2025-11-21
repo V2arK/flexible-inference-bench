@@ -9,6 +9,7 @@ import traceback
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+import uuid
 
 import aiohttp
 import grpc
@@ -88,27 +89,30 @@ def _normalize_grpc_target(api_url: str) -> str:
     return f"{host}:{port}"
 
 
-async def _get_grpc_stub(api_url: str, force_new_connection: bool = False) -> openai_pb2_grpc.VLLMServiceStub:
+async def _get_grpc_stub(api_url: str, force_new_connection: bool = False) -> Tuple[openai_pb2_grpc.VLLMServiceStub, Optional[grpc.aio.Channel]]:
     target = _normalize_grpc_target(api_url)
     
     if force_new_connection:
-        channel = grpc.aio.insecure_channel(target)
+        # Force a new connection by passing a unique channel argument.
+        # This prevents gRPC C-core from reusing existing subchannels to the same target.
+        unique_opt = [('fib.channel_id', str(uuid.uuid4()))]
+        channel = grpc.aio.insecure_channel(target, options=unique_opt)
         # We don't wait for channel ready here to avoid overhead, trusting gRPC to connect.
         # Also we don't cache it.
         stub = openai_pb2_grpc.VLLMServiceStub(channel)
-        return stub
+        return stub, channel
 
     loop = asyncio.get_running_loop()
     key = (target, id(loop))
     async with _GRPC_STUB_LOCK:
         if key in _GRPC_STUBS:
-            return _GRPC_STUBS[key]
+            return _GRPC_STUBS[key], None
         channel = grpc.aio.insecure_channel(target)
         await channel.channel_ready()
         stub = openai_pb2_grpc.VLLMServiceStub(channel)
         _GRPC_CHANNELS[key] = channel
         _GRPC_STUBS[key] = stub
-        return stub
+        return stub, None
 
 
 def _build_grpc_completion_request(request_func_input: RequestFuncInput) -> openai_pb2.CompletionRequest:
@@ -749,8 +753,9 @@ async def async_request_openai_grpc_completions(
     if verbose:
         print_verbose(idx, request_func_input, st, 0, 0, True)
 
+    channel = None
     try:
-        stub = await _get_grpc_stub(request_func_input.api_url, request_func_input.force_new_grpc_connection)
+        stub, channel = await _get_grpc_stub(request_func_input.api_url, request_func_input.force_new_grpc_connection)
         if request_func_input.stream:
             stream = stub.CompletionStream(request_proto)
             async for chunk in stream:
@@ -804,6 +809,9 @@ async def async_request_openai_grpc_completions(
         error_msg = f"{exc.code().name}: {details}".strip()
         output.success = False
         output.error = error_msg
+    finally:
+        if channel:
+            await channel.close()
 
     if pbar:
         pbar.update(1)
@@ -824,8 +832,9 @@ async def async_request_openai_grpc_chat_completions(
     if verbose:
         print_verbose(idx, request_func_input, st, 0, 0, True)
 
+    channel = None
     try:
-        stub = await _get_grpc_stub(request_func_input.api_url, request_func_input.force_new_grpc_connection)
+        stub, channel = await _get_grpc_stub(request_func_input.api_url, request_func_input.force_new_grpc_connection)
         if request_func_input.stream:
             stream = stub.ChatCompletionStream(request_proto)
             async for chunk in stream:
@@ -880,6 +889,9 @@ async def async_request_openai_grpc_chat_completions(
         error_msg = f"{exc.code().name}: {details}".strip()
         output.success = False
         output.error = error_msg
+    finally:
+        if channel:
+            await channel.close()
 
     if pbar:
         pbar.update(1)
