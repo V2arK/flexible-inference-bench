@@ -1,16 +1,22 @@
 # Taken from vLLM benchmarks
 # pylint: disable=too-many-positional-arguments
+import asyncio
 import json
 import os
 import sys
 import time
 import traceback
-from typing import List, Optional, Dict, Any
 from contextlib import nullcontext
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+
 import aiohttp
-from tqdm.asyncio import tqdm
+import grpc
 from opentelemetry import trace
+from pydantic import BaseModel, Field
+from tqdm.asyncio import tqdm
+
+from flexible_inference_benchmark.grpc.proto import openai_pb2, openai_pb2_grpc
 from flexible_inference_benchmark.utils.telemetry import create_span_attributes
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
@@ -59,6 +65,103 @@ class RequestFuncOutput(BaseModel):
     prompt_len: int = 0
     error: str = ""
     output_len: Optional[int] = None
+
+
+_GRPC_STUBS: Dict[Tuple[str, int], openai_pb2_grpc.VLLMServiceStub] = {}
+_GRPC_CHANNELS: Dict[Tuple[str, int], grpc.aio.Channel] = {}
+_GRPC_STUB_LOCK = asyncio.Lock()
+
+
+def _normalize_grpc_target(api_url: str) -> str:
+    if not api_url:
+        raise ValueError("gRPC base URL must be provided.")
+    candidate = api_url if "://" in api_url else f"grpc://{api_url}"
+    parsed = urlparse(candidate)
+    host = parsed.hostname
+    if host is None:
+        path_host = parsed.path.lstrip("/")
+        host = path_host.split("/")[0] if path_host else None
+    port = parsed.port
+    if host is None or port is None:
+        raise ValueError(f"Invalid gRPC base URL '{api_url}'. Expected format like grpc://host:port")
+    return f"{host}:{port}"
+
+
+async def _get_grpc_stub(api_url: str) -> openai_pb2_grpc.VLLMServiceStub:
+    target = _normalize_grpc_target(api_url)
+    loop = asyncio.get_running_loop()
+    key = (target, id(loop))
+    async with _GRPC_STUB_LOCK:
+        if key in _GRPC_STUBS:
+            return _GRPC_STUBS[key]
+        channel = grpc.aio.insecure_channel(target)
+        await channel.channel_ready()
+        stub = openai_pb2_grpc.VLLMServiceStub(channel)
+        _GRPC_CHANNELS[key] = channel
+        _GRPC_STUBS[key] = stub
+        return stub
+
+
+def _build_grpc_completion_request(request_func_input: RequestFuncInput) -> openai_pb2.CompletionRequest:
+    request = openai_pb2.CompletionRequest(
+        model=request_func_input.model,
+        prompt=request_func_input.prompt,
+    )
+    request.max_tokens = int(request_func_input.output_len)
+    request.stream = request_func_input.stream
+    request.temperature = max(0.0, request_func_input.temperature)
+    if request_func_input.top_p is not None:
+        request.top_p = float(request_func_input.top_p)
+    if request_func_input.top_k is not None:
+        request.top_k = int(request_func_input.top_k)
+    if request_func_input.best_of > 1:
+        request.best_of = int(request_func_input.best_of)
+    if request_func_input.logprobs is not None:
+        request.logprobs = True
+        request.top_logprobs = int(request_func_input.logprobs)
+    return request
+
+
+
+def _build_grpc_chat_request(request_func_input: RequestFuncInput) -> openai_pb2.ChatCompletionRequest:
+    content = request_func_input.prompt
+    if request_func_input.media:
+        media_lines = "\n".join(f"[Image: {item}]" for item in request_func_input.media)
+        content = f"{content}\n{media_lines}" if content else media_lines
+
+    append_msg = ""
+    if request_func_input.custom_prompt:
+        append_msg += request_func_input.custom_prompt
+    if request_func_input.include_schema_in_prompt and request_func_input.json_schema:
+        if append_msg:
+            append_msg += "\n\n"
+        append_msg += "Please follow this JSON schema for your response:\n```json\n"
+        append_msg += json.dumps(request_func_input.json_schema, indent=2)
+        append_msg += "\n```"
+    if request_func_input.json_response and not request_func_input.json_schema:
+        if append_msg:
+            append_msg += "\n\n"
+        append_msg += "Please respond with a valid JSON object."
+    if append_msg:
+        content = f"{content}\n\n{append_msg}" if content else append_msg
+
+    messages = [openai_pb2.ChatMessage(role="user", content=content)]
+    request = openai_pb2.ChatCompletionRequest(model=request_func_input.model, messages=messages)
+    request.max_tokens = int(request_func_input.output_len)
+    request.stream = request_func_input.stream
+    request.temperature = max(0.0, request_func_input.temperature)
+    if request_func_input.top_p is not None:
+        request.top_p = float(request_func_input.top_p)
+    if request_func_input.top_k is not None:
+        request.top_k = int(request_func_input.top_k)
+    if request_func_input.best_of > 1:
+        request.best_of = int(request_func_input.best_of)
+    if request_func_input.use_beam_search:
+        request.use_beam_search = True
+    if request_func_input.logprobs is not None:
+        request.logprobs = True
+        request.top_logprobs = int(request_func_input.logprobs)
+    return request
 
 
 def apply_sampling_params(
@@ -621,6 +724,159 @@ async def async_request_openai_chat_completions(
             return output
 
 
+
+
+
+async def async_request_openai_grpc_completions(
+    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+) -> RequestFuncOutput:
+    del wait_time
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    request_proto = _build_grpc_completion_request(request_func_input)
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    ttft = 0.0
+    generated_text = ""
+    if verbose:
+        print_verbose(idx, request_func_input, st, 0, 0, True)
+
+    try:
+        stub = await _get_grpc_stub(request_func_input.api_url)
+        if request_func_input.stream:
+            stream = stub.CompletionStream(request_proto)
+            async for chunk in stream:
+                timestamp = time.perf_counter()
+                chunk_text = ""
+                finish_reason = ""
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    chunk_text = choice.text
+                    finish_reason = choice.finish_reason or ""
+                if chunk_text:
+                    if ttft == 0.0:
+                        ttft = timestamp - st
+                        output.ttft = ttft
+                    else:
+                        output.itl.append(timestamp - most_recent_timestamp)
+                    generated_text += chunk_text
+                    most_recent_timestamp = timestamp
+                if chunk.usage:
+                    if chunk.usage.prompt_tokens:
+                        output.prompt_len = int(chunk.usage.prompt_tokens)
+                    if chunk.usage.completion_tokens:
+                        output.output_len = int(chunk.usage.completion_tokens)
+                if finish_reason:
+                    break
+            output.latency = time.perf_counter() - st
+            output.generated_text = generated_text
+            output.success = True
+            if verbose:
+                print_verbose(idx, request_func_input, 0, most_recent_timestamp, output.latency, False)
+        else:
+            response = await stub.Completion(request_proto)
+            rcv_time = time.perf_counter()
+            output.latency = rcv_time - st
+            if response.choices:
+                output.generated_text = response.choices[0].text
+            if response.usage:
+                if response.usage.prompt_tokens:
+                    output.prompt_len = int(response.usage.prompt_tokens)
+                if response.usage.completion_tokens:
+                    output.output_len = int(response.usage.completion_tokens)
+            output.ttft = 0.0
+            output.success = True
+            if verbose:
+                print_verbose(idx, request_func_input, 0, rcv_time, output.latency, False)
+    except ValueError as exc:
+        output.success = False
+        output.error = str(exc)
+    except grpc.aio.AioRpcError as exc:
+        details = exc.details() or ""
+        error_msg = f"{exc.code().name}: {details}".strip()
+        output.success = False
+        output.error = error_msg
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_openai_grpc_chat_completions(
+    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+) -> RequestFuncOutput:
+    del wait_time
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    request_proto = _build_grpc_chat_request(request_func_input)
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    ttft = 0.0
+    generated_text = ""
+    if verbose:
+        print_verbose(idx, request_func_input, st, 0, 0, True)
+
+    try:
+        stub = await _get_grpc_stub(request_func_input.api_url)
+        if request_func_input.stream:
+            stream = stub.ChatCompletionStream(request_proto)
+            async for chunk in stream:
+                timestamp = time.perf_counter()
+                delta_text = ""
+                finish_reason = ""
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    finish_reason = choice.finish_reason or ""
+                    delta_obj = choice.delta
+                    delta_text = delta_obj.content or delta_obj.reasoning_content or ""
+                if delta_text:
+                    if ttft == 0.0:
+                        ttft = timestamp - st
+                        output.ttft = ttft
+                    else:
+                        output.itl.append(timestamp - most_recent_timestamp)
+                    generated_text += delta_text
+                    most_recent_timestamp = timestamp
+                if chunk.usage:
+                    if chunk.usage.prompt_tokens:
+                        output.prompt_len = int(chunk.usage.prompt_tokens)
+                    if chunk.usage.completion_tokens:
+                        output.output_len = int(chunk.usage.completion_tokens)
+                if finish_reason:
+                    break
+            output.latency = time.perf_counter() - st
+            output.generated_text = generated_text
+            output.success = True
+            if verbose:
+                print_verbose(idx, request_func_input, 0, most_recent_timestamp, output.latency, False)
+        else:
+            response = await stub.ChatCompletion(request_proto)
+            rcv_time = time.perf_counter()
+            output.latency = rcv_time - st
+            if response.choices:
+                output.generated_text = response.choices[0].message.content
+            if response.usage:
+                if response.usage.prompt_tokens:
+                    output.prompt_len = int(response.usage.prompt_tokens)
+                if response.usage.completion_tokens:
+                    output.output_len = int(response.usage.completion_tokens)
+            output.ttft = 0.0
+            output.success = True
+            if verbose:
+                print_verbose(idx, request_func_input, 0, rcv_time, output.latency, False)
+    except ValueError as exc:
+        output.success = False
+        output.error = str(exc)
+    except grpc.aio.AioRpcError as exc:
+        details = exc.details() or ""
+        error_msg = f"{exc.code().name}: {details}".strip()
+        output.success = False
+        output.error = error_msg
+
+    if pbar:
+        pbar.update(1)
+    return output
+
 async def async_request_cserve_debug(
     idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
 ) -> RequestFuncOutput:
@@ -833,6 +1089,9 @@ ASYNC_REQUEST_FUNCS = {
     "deepspeed-mii": async_request_deepspeed_mii,
     "openai": async_request_openai_completions,
     "openai-chat": async_request_openai_chat_completions,
+    "openai-grpc": async_request_openai_grpc_completions,
+    "vllm-grpc": async_request_openai_grpc_completions,
+    "openai-chat-grpc": async_request_openai_grpc_chat_completions,
     "tensorrt-llm": async_request_trt_llm,
     "profiler": async_request_profiler,
 }

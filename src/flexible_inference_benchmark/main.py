@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_NUM_TRIALS = 10
 MAX_TRIALS = 100  # Maximum trials for prompt generation, warn if exceeded
 
+GRPC_BACKENDS = {"openai-grpc", "vllm-grpc", "openai-chat-grpc"}
+
 
 def return_random_image_by_size(width: int, height: int, convert_to_base64: bool = False) -> Any:
 
@@ -707,35 +709,41 @@ def parse_args() -> argparse.Namespace:
             args.num_of_req = 1
 
         openapi = None
-        if not args.base_url or not args.model or not args.endpoint:
+        if args.backend in GRPC_BACKENDS:
             if not args.base_url:
-                logger.info("Base url not provided. Searching for ports on localhost...")
-                base_try_options = ["http://localhost:8000", "http://localhost:8080"]
-            else:
-                base_try_options = [args.base_url]
-            for base_url, path in itertools.product(base_try_options, ["openapi.json", "health", "openai/health"]):
-                try:
-                    response = requests.get(f"{base_url}/{path}", timeout=1)
-                    response.raise_for_status()
-                    args.base_url = base_url
-                    if "openapi" in path:
-                        openapi = response.json()
-                    break
-                except (requests.HTTPError, requests.ConnectionError):
-                    continue
-            if not args.base_url:
-                fail("No server found. Please provide the base url.")
-            logger.info(f"Server found at {args.base_url}. Continuing.")
-        if not args.model:
-            logger.info("Model name not provided. Trying to query the model name from the server.")
-            model = try_find_model(args.base_url, openapi)
-            if model is None:
-                fail("Model could not be deduced automatically. Please provide the model name.")
-            else:
-                logger.info(f"Model identified: {model}")
-                args.model = model
-        if not args.endpoint:
-            args.endpoint = try_find_endpoint(args.base_url, openapi)
+                fail("Base url must be provided for gRPC backends.")
+            if not args.model:
+                fail("Model name must be provided for gRPC backends.")
+        else:
+            if not args.base_url or not args.model or not args.endpoint:
+                if not args.base_url:
+                    logger.info("Base url not provided. Searching for ports on localhost...")
+                    base_try_options = ["http://localhost:8000", "http://localhost:8080"]
+                else:
+                    base_try_options = [args.base_url]
+                for base_url, path in itertools.product(base_try_options, ["openapi.json", "health", "openai/health"]):
+                    try:
+                        response = requests.get(f"{base_url}/{path}", timeout=1)
+                        response.raise_for_status()
+                        args.base_url = base_url
+                        if "openapi" in path:
+                            openapi = response.json()
+                        break
+                    except (requests.HTTPError, requests.ConnectionError):
+                        continue
+                if not args.base_url:
+                    fail("No server found. Please provide the base url.")
+                logger.info(f"Server found at {args.base_url}. Continuing.")
+            if not args.model:
+                logger.info("Model name not provided. Trying to query the model name from the server.")
+                model = try_find_model(args.base_url, openapi)
+                if model is None:
+                    fail("Model could not be deduced automatically. Please provide the model name.")
+                else:
+                    logger.info(f"Model identified: {model}")
+                    args.model = model
+            if not args.endpoint:
+                args.endpoint = try_find_endpoint(args.base_url, openapi)
         if args.endpoint and args.endpoint[0] != '/':
             args.endpoint = "/" + args.endpoint
 
@@ -854,9 +862,12 @@ def run_main(args: argparse.Namespace) -> None:
 
         set_max_open_files(min_length + 256)
 
-        base_url = args.base_url.strip("/")
-        endpoint = args.endpoint.strip("/")
-        args.api_url = f"{base_url}/{endpoint}"
+        base_url = args.base_url.strip("/") if args.base_url else ""
+        endpoint = args.endpoint.strip("/") if args.endpoint else ""
+        if args.backend in GRPC_BACKENDS:
+            args.api_url = base_url
+        else:
+            args.api_url = f"{base_url}/{endpoint}" if endpoint else base_url
 
         # JSON processing and validation handled in parse_args()
         custom_prompt = args.json_prompt
