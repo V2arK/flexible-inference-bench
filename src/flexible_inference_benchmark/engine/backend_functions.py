@@ -56,6 +56,7 @@ class RequestFuncInput(BaseModel):
     json_schema: Optional[Dict[str, Any]] = None
     include_schema_in_prompt: bool = False
     force_new_grpc_connection: bool = False
+    force_new_http_connection: bool = False
 
 
 class RequestFuncOutput(BaseModel):
@@ -72,6 +73,17 @@ class RequestFuncOutput(BaseModel):
 _GRPC_STUBS: Dict[Tuple[str, int], openai_pb2_grpc.VLLMServiceStub] = {}
 _GRPC_CHANNELS: Dict[Tuple[str, int], grpc.aio.Channel] = {}
 _GRPC_STUB_LOCK = asyncio.Lock()
+
+
+def _build_http_session_kwargs(
+    request_func_input: RequestFuncInput, cookies: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    session_kwargs: Dict[str, Any] = {"timeout": AIOHTTP_TIMEOUT}
+    if cookies:
+        session_kwargs["cookies"] = cookies
+    if request_func_input.force_new_http_connection:
+        session_kwargs["connector"] = aiohttp.TCPConnector(force_close=True)
+    return session_kwargs
 
 
 def _normalize_grpc_target(api_url: str) -> str:
@@ -204,7 +216,7 @@ async def async_request_tgi(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
         assert not request_func_input.use_beam_search
         assert request_func_input.logprobs is None
         params = {
@@ -272,7 +284,7 @@ async def async_request_trt_llm(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
         assert not request_func_input.use_beam_search
         assert request_func_input.best_of == 1
         assert request_func_input.logprobs is None
@@ -342,7 +354,7 @@ async def async_request_trt_llm(
 async def async_request_deepspeed_mii(
     idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
 ) -> RequestFuncOutput:
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
         assert request_func_input.best_of == 1
         assert not request_func_input.use_beam_search
         assert request_func_input.logprobs is None
@@ -397,7 +409,9 @@ async def async_request_openai_completions(
     assert not request_func_input.use_beam_search
 
     if request_func_input.stream:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with aiohttp.ClientSession(
+            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
+        ) as session:
             payload = {
                 "model": request_func_input.model,
                 "prompt": request_func_input.prompt,
@@ -482,7 +496,9 @@ async def async_request_openai_completions(
                 exc_info = sys.exc_info()
                 output.error += "".join(traceback.format_exception(*exc_info))
     else:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with aiohttp.ClientSession(
+            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
+        ) as session:
             payload = {
                 "model": request_func_input.model,
                 "prompt": request_func_input.prompt,
@@ -567,7 +583,7 @@ async def async_request_openai_chat_completions(
         else nullcontext()
     )
     with otel_span as span:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
             assert not request_func_input.use_beam_search
 
             # Apply custom prompt and schema formatting
@@ -906,7 +922,9 @@ async def async_request_cserve_debug(
     assert request_func_input.logprobs is None
 
     if request_func_input.stream:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with aiohttp.ClientSession(
+            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
+        ) as session:
             payload = {
                 "prompt": request_func_input.prompt,
                 "sampling_params": {"n": 1, "max_tokens": request_func_input.output_len},
@@ -971,7 +989,9 @@ async def async_request_cserve_debug(
                 output.error = "".join(traceback.format_exception(*exc_info))
 
     else:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with aiohttp.ClientSession(
+            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
+        ) as session:
             payload = {
                 "prompt": request_func_input.prompt,
                 "sampling_params": {
@@ -1058,7 +1078,7 @@ async def async_request_profiler(
         "stop_profile"
     ), "Torch Profiler API URL must end with 'start_profile' or 'stop_profile'."
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
         payload = {
             "model": request_func_input.model,
             "messages": [],

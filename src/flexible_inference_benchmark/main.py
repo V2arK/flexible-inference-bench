@@ -551,6 +551,12 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
         help="Force creating a new gRPC connection for every request instead of reusing channels.",
     )
 
+    benchmark_parser.add_argument(
+        "--force-new-http-connection",
+        action="store_true",
+        help="Force HTTP requests to close sockets after every response (disable keep-alive).",
+    )
+
     return benchmark_parser
 
 
@@ -905,6 +911,7 @@ def run_main(args: argparse.Namespace) -> None:
             json_schema=json_schema,
             include_schema_in_prompt=getattr(args, 'include_schema_in_prompt', False),
             force_new_grpc_connection=getattr(args, 'force_new_grpc_connection', False),
+            force_new_http_connection=getattr(args, 'force_new_http_connection', False),
         )
         # disable verbose output for validation of the endpoint. This is done to avoid confusion on terminal output.
         client_verbose_value = client.verbose
