@@ -5,6 +5,12 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${SCRIPT_DIR}/concurrency-test-results"
+
+mkdir -p "$RESULTS_DIR"
+cd "$RESULTS_DIR"
+
 # Colors for output (must be defined before use)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -14,8 +20,7 @@ NC='\033[0m' # No Color
 
 echo "=== CentML Platform Extended Concurrency Test Suite ==="
 echo "Optimized for 4-replica deployment"
-echo "Testing backend: https://honglintest.d691afed.c-09.centml.com"
-echo "Model: Qwen/Qwen2.5-VL-7B-Instruct"
+echo "Targets and models are resolved from each config (after overrides)."
 echo ""
 
 echo -e "${YELLOW}📝 Timestamp Logging for Manual API Data Collection:${NC}"
@@ -25,10 +30,6 @@ echo "https://api.centml.com/deployments/usage/4186"
 echo ""
 echo -e "${GREEN}✅ Test timestamps will be logged for manual API data collection${NC}"
 echo ""
-
-# Create results directory
-mkdir -p concurrency-test-results
-cd concurrency-test-results
 
 # Metrics to collect for single-replica comparison
 BASELINE_METRICS=(
@@ -203,6 +204,58 @@ EOF
     echo -e "${GREEN}✅ Comparison summary saved to $summary_file${NC}"
 }
 
+format_full_url() {
+    local base_url=$1
+    local endpoint=$2
+
+    if [ -z "$endpoint" ] || [[ "$endpoint" == "null" ]]; then
+        echo "$base_url"
+        return
+    fi
+
+    if [[ "$endpoint" == http://* || "$endpoint" == https://* ]]; then
+        echo "$endpoint"
+        return
+    fi
+
+    if [ -z "$base_url" ]; then
+        echo "$endpoint"
+        return
+    fi
+
+    local base_trimmed="${base_url%/}"
+    local endpoint_trimmed="${endpoint#/}"
+    echo "${base_trimmed}/${endpoint_trimmed}"
+}
+
+extract_config_metadata() {
+    local source_file=$1
+    python3 - "$source_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+if not source.is_file():
+    sys.exit(1)
+
+with source.open() as handle:
+    data = json.load(handle)
+
+def safe_get(key):
+    value = data.get(key)
+    if value is None:
+        return ""
+    return str(value)
+
+print(f"base_url={safe_get('base_url')}")
+print(f"endpoint={safe_get('endpoint')}")
+print(f"model={safe_get('model')}")
+print(f"backend={safe_get('backend')}")
+print(f"output_file={safe_get('output_file')}")
+PY
+}
+
 # Function to get current timestamp
 get_timestamp() {
     date +%s
@@ -251,12 +304,19 @@ get_test_info() {
 # Function to run test and analyze results
 run_test() {
     local config_file=$1
+    local config_path="${SCRIPT_DIR}/${config_file}"
     local test_info=$(get_test_info "$config_file")
     IFS='|' read -r test_name concurrent_limit rps_limit warning_msg <<< "$test_info"
     
     echo -e "${BLUE}--- Running $test_name ---${NC}"
     echo "Max Concurrent: $concurrent_limit | Target RPS: $rps_limit"
     echo "Configuration: $config_file"
+    
+    if [ ! -f "$config_path" ]; then
+        echo -e "${RED}❌ Config file not found: $config_path${NC}"
+        echo ""
+        return 1
+    fi
     
     if [ ! -z "$warning_msg" ]; then
         echo -e "${YELLOW}⚠️  WARNING: $warning_msg${NC}"
@@ -265,7 +325,46 @@ run_test() {
     
     # Prepare config file (allows environment variable overrides)
     local prepared_config
-    prepared_config=$(prepare_config "../$config_file")
+    prepared_config=$(prepare_config "$config_path")
+    local metadata_source="$prepared_config"
+
+    local config_metadata
+    if ! config_metadata=$(extract_config_metadata "$metadata_source"); then
+        echo -e "${RED}❌ Failed to read config metadata from $metadata_source${NC}"
+        rm -f "$prepared_config"
+        echo ""
+        return 1
+    fi
+
+    local base_url=""
+    local endpoint=""
+    local model=""
+    local backend=""
+    local output_file=""
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            base_url) base_url="$value" ;;
+            endpoint) endpoint="$value" ;;
+            model) model="$value" ;;
+            backend) backend="$value" ;;
+            output_file) output_file="$value" ;;
+        esac
+    done <<< "$config_metadata"
+
+    local full_target=""
+    full_target=$(format_full_url "$base_url" "$endpoint")
+
+    echo "Target URL: ${full_target:-'(not specified)'}"
+    echo "Backend: ${backend:-'(not specified)'}"
+    echo "Model: ${model:-'(not specified)'}"
+
+    if [ -z "$output_file" ]; then
+        echo -e "${RED}❌ output_file missing in $config_path${NC}"
+        rm -f "$prepared_config"
+        echo ""
+        return 1
+    fi
     
     # Capture start time for baseline data collection
     local test_start_time=$(get_timestamp)
@@ -286,16 +385,6 @@ run_test() {
     local test_end_time=$(get_timestamp)
     
     # Analyze results if output file exists
-    local output_file=$(grep '"output_file"' "../$config_file" | cut -d'"' -f4)
-    if [ -z "$output_file" ]; then
-        echo -e "${RED}❌ Error: Could not extract output_file from config${NC}"
-        echo "Config file: ../$config_file"
-        echo "Config file content:"
-        cat "../$config_file"
-        rm -f "$prepared_config"
-        return
-    fi
-    
     echo -e "${BLUE}📊 Expected output file: $output_file${NC}"
     echo "Current directory: $(pwd)"
     
@@ -395,9 +484,9 @@ run_single_test() {
 
 # Auto-run mode - check for command line argument
 if [ $# -eq 0 ]; then
-    echo "No arguments provided. Running Full Suite automatically..."
+    echo "No arguments provided. Running Extended Suite automatically (skipping Peak/Burst by default)..."
     echo ""
-    run_full_suite
+    run_extended_suite
 else
     case $1 in
         1|basic) run_basic_suite ;;

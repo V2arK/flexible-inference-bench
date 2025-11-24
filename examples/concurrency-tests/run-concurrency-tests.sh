@@ -5,10 +5,22 @@
 
 set -e
 
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${SCRIPT_DIR}/concurrency-test-results"
+
+mkdir -p "$RESULTS_DIR"
+cd "$RESULTS_DIR"
+
 echo "=== CentML Platform Extended Concurrency Test Suite ==="
 echo "Optimized for 4-replica deployment"
-echo "Testing backend: https://honglintest.d691afed.c-09.centml.com"
-echo "Model: Qwen/Qwen2.5-VL-7B-Instruct"
+echo "Targets and models are read directly from each config file."
 echo ""
 
 echo -e "${YELLOW}📝 Timestamp Logging for Manual API Data Collection:${NC}"
@@ -18,17 +30,6 @@ echo "https://api.centml.com/deployments/usage/4186"
 echo ""
 echo -e "${GREEN}✅ Test timestamps will be logged for manual API data collection${NC}"
 echo ""
-
-# Create results directory
-mkdir -p concurrency-test-results
-cd concurrency-test-results
-
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
 
 # Metrics to collect for single-replica comparison
 BASELINE_METRICS=(
@@ -79,6 +80,58 @@ log_test_timestamps() {
     echo "   Duration: $(($end_time - $start_time))s"
     
     echo -e "${GREEN}✅ Logged to $timestamp_file${NC}"
+}
+
+format_full_url() {
+    local base_url=$1
+    local endpoint=$2
+
+    if [ -z "$endpoint" ] || [[ "$endpoint" == "null" ]]; then
+        echo "$base_url"
+        return
+    fi
+
+    if [[ "$endpoint" == http://* || "$endpoint" == https://* ]]; then
+        echo "$endpoint"
+        return
+    fi
+
+    if [ -z "$base_url" ]; then
+        echo "$endpoint"
+        return
+    fi
+
+    local base_trimmed="${base_url%/}"
+    local endpoint_trimmed="${endpoint#/}"
+    echo "${base_trimmed}/${endpoint_trimmed}"
+}
+
+extract_config_metadata() {
+    local source_file=$1
+    python3 - "$source_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+if not source.is_file():
+    sys.exit(1)
+
+with source.open() as handle:
+    data = json.load(handle)
+
+def safe_get(key):
+    value = data.get(key)
+    if value is None:
+        return ""
+    return str(value)
+
+print(f"base_url={safe_get('base_url')}")
+print(f"endpoint={safe_get('endpoint')}")
+print(f"model={safe_get('model')}")
+print(f"backend={safe_get('backend')}")
+print(f"output_file={safe_get('output_file')}")
+PY
 }
 
 # Function to generate a summary report with timestamps for manual data collection
@@ -220,6 +273,7 @@ get_test_info() {
 # Function to run test and analyze results
 run_test() {
     local config_file=$1
+    local config_path="${SCRIPT_DIR}/${config_file}"
     local test_info=$(get_test_info "$config_file")
     IFS='|' read -r test_name concurrent_limit rps_limit warning_msg <<< "$test_info"
     
@@ -227,17 +281,59 @@ run_test() {
     echo "Max Concurrent: $concurrent_limit | Target RPS: $rps_limit"
     echo "Configuration: $config_file"
     
+    if [ ! -f "$config_path" ]; then
+        echo -e "${RED}❌ Config file not found: $config_path${NC}"
+        echo ""
+        return 1
+    fi
+    
     if [ ! -z "$warning_msg" ]; then
         echo -e "${YELLOW}⚠️  WARNING: $warning_msg${NC}"
         echo "Continuing automatically..."
     fi
     
+    local config_metadata
+    if ! config_metadata=$(extract_config_metadata "$config_path"); then
+        echo -e "${RED}❌ Failed to read config metadata from $config_path${NC}"
+        echo ""
+        return 1
+    fi
+
+    local base_url=""
+    local endpoint=""
+    local model=""
+    local backend=""
+    local output_file=""
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            base_url) base_url="$value" ;;
+            endpoint) endpoint="$value" ;;
+            model) model="$value" ;;
+            backend) backend="$value" ;;
+            output_file) output_file="$value" ;;
+        esac
+    done <<< "$config_metadata"
+
+    local full_target=""
+    full_target=$(format_full_url "$base_url" "$endpoint")
+
+    echo "Target URL: ${full_target:-'(not specified)'}"
+    echo "Backend: ${backend:-'(not specified)'}"
+    echo "Model: ${model:-'(not specified)'}"
+
+    if [ -z "$output_file" ]; then
+        echo -e "${RED}❌ output_file missing in $config_path${NC}"
+        echo ""
+        return 1
+    fi
+
     # Capture start time for baseline data collection
     local test_start_time=$(get_timestamp)
     
     # Run benchmark
     echo -e "${GREEN}🚀 Starting test...${NC}"
-    if fib benchmark --config-file "../$config_file"; then
+    if fib benchmark --config-file "$config_path"; then
         echo -e "${GREEN}✅ Test completed successfully${NC}"
     else
         echo -e "${RED}❌ Test failed or encountered errors${NC}"
@@ -250,7 +346,6 @@ run_test() {
     local test_end_time=$(get_timestamp)
     
     # Analyze results if output file exists
-    local output_file=$(grep '"output_file"' "../$config_file" | cut -d'"' -f4)
     if [ -f "$output_file" ]; then
         echo ""
         echo -e "${BLUE}📊 Results for $test_name:${NC}"

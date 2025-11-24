@@ -6,6 +6,12 @@
 
 set -e
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_DIR="${SCRIPT_DIR}/concurrency-test-results"
+
+mkdir -p "$RESULTS_DIR"
+cd "$RESULTS_DIR"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -13,27 +19,17 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-BASE_URL=${FIB_HTTP_BASE_URL:-http://localhost:8000}
-ENDPOINT=${FIB_HTTP_ENDPOINT:-/v1/completions}
-MODEL_NAME=${FIB_HTTP_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}
-BACKEND_NAME=${FIB_HTTP_BACKEND:-vllm}
-
-if [[ -z "$ENDPOINT" ]]; then
-    FULL_ENDPOINT="$BASE_URL"
-elif [[ "$ENDPOINT" == http://* || "$ENDPOINT" == https://* ]]; then
-    FULL_ENDPOINT="$ENDPOINT"
-else
-    BASE_TRIMMED="${BASE_URL%/}"
-    ENDPOINT_TRIMMED="${ENDPOINT#/}"
-    FULL_ENDPOINT="${BASE_TRIMMED}/${ENDPOINT_TRIMMED}"
-fi
+BASE_URL_OVERRIDE=${FIB_HTTP_BASE_URL:-}
+ENDPOINT_OVERRIDE=${FIB_HTTP_ENDPOINT:-}
+MODEL_OVERRIDE=${FIB_HTTP_MODEL:-}
+BACKEND_OVERRIDE=${FIB_HTTP_BACKEND:-}
 
 echo '=== CentML HTTP Concurrency Test Suite (Force New Connection) ==='
-echo "Base URL: $BASE_URL"
-echo "Endpoint path: ${ENDPOINT:-'(none - using base URL only)'}"
-echo "Effective target: $FULL_ENDPOINT"
-echo "Backend flag: $BACKEND_NAME"
-echo "Model: $MODEL_NAME"
+echo "Env override base URL: ${BASE_URL_OVERRIDE:-'(from config files)'}"
+echo "Env override endpoint: ${ENDPOINT_OVERRIDE:-'(from config files)'}"
+echo "Env override backend flag: ${BACKEND_OVERRIDE:-'(from config files)'}"
+echo "Env override model: ${MODEL_OVERRIDE:-'(from config files)'}"
+echo "Actual targets/models will be logged for each test run."
 echo ''
 
 echo -e "${YELLOW}📝 Timestamp logging is enabled for downstream analysis.${NC}"
@@ -42,10 +38,6 @@ echo ''
 echo -e "${GREEN}✅ Results will be stored under concurrency-test-results/${NC}"
 
 echo ''
-
-# Create results directory
-mkdir -p concurrency-test-results
-cd concurrency-test-results
 
 # Metrics to collect for single-replica comparison
 BASELINE_METRICS=(
@@ -223,6 +215,58 @@ EOF
     echo -e "${GREEN}✅ Comparison summary saved to $summary_file${NC}"
 }
 
+format_full_url() {
+    local base_url=$1
+    local endpoint=$2
+
+    if [ -z "$endpoint" ] || [[ "$endpoint" == "null" ]]; then
+        echo "$base_url"
+        return
+    fi
+
+    if [[ "$endpoint" == http://* || "$endpoint" == https://* ]]; then
+        echo "$endpoint"
+        return
+    fi
+
+    if [ -z "$base_url" ]; then
+        echo "$endpoint"
+        return
+    fi
+
+    local base_trimmed="${base_url%/}"
+    local endpoint_trimmed="${endpoint#/}"
+    echo "${base_trimmed}/${endpoint_trimmed}"
+}
+
+extract_config_metadata() {
+    local source_file=$1
+    python3 - "$source_file" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+if not source.is_file():
+    sys.exit(1)
+
+with source.open() as handle:
+    data = json.load(handle)
+
+def safe_get(key):
+    value = data.get(key)
+    if value is None:
+        return ""
+    return str(value)
+
+print(f"base_url={safe_get('base_url')}")
+print(f"endpoint={safe_get('endpoint')}")
+print(f"model={safe_get('model')}")
+print(f"backend={safe_get('backend')}")
+print(f"output_file={safe_get('output_file')}")
+PY
+}
+
 # Function to get current timestamp
 get_timestamp() {
     date +%s
@@ -271,6 +315,7 @@ get_test_info() {
 # Function to run test and analyze results
 run_test() {
     local config_file=$1
+    local config_path="${SCRIPT_DIR}/${config_file}"
     local test_info=$(get_test_info "$config_file")
     IFS='|' read -r test_name concurrent_limit rps_limit warning_msg <<< "$test_info"
     
@@ -278,13 +323,58 @@ run_test() {
     echo "Max Concurrent: $concurrent_limit | Target RPS: $rps_limit"
     echo "Configuration: $config_file"
     
+    if [ ! -f "$config_path" ]; then
+        echo -e "${RED}❌ Config file not found: $config_path${NC}"
+        echo ""
+        return 1
+    fi
+    
     if [ ! -z "$warning_msg" ]; then
         echo -e "${YELLOW}⚠️  WARNING: $warning_msg${NC}"
         echo "Continuing automatically..."
     fi
     
     local prepared_config
-    prepared_config=$(prepare_config "../$config_file")
+    prepared_config=$(prepare_config "$config_path")
+    local metadata_source="$prepared_config"
+
+    local config_metadata
+    if ! config_metadata=$(extract_config_metadata "$metadata_source"); then
+        echo -e "${RED}❌ Failed to read config metadata from $metadata_source${NC}"
+        rm -f "$prepared_config"
+        echo ""
+        return 1
+    fi
+
+    local base_url=""
+    local endpoint=""
+    local model=""
+    local backend=""
+    local output_file=""
+
+    while IFS='=' read -r key value; do
+        case "$key" in
+            base_url) base_url="$value" ;;
+            endpoint) endpoint="$value" ;;
+            model) model="$value" ;;
+            backend) backend="$value" ;;
+            output_file) output_file="$value" ;;
+        esac
+    done <<< "$config_metadata"
+
+    local full_target=""
+    full_target=$(format_full_url "$base_url" "$endpoint")
+
+    echo "Target URL: ${full_target:-'(not specified)'}"
+    echo "Backend: ${backend:-'(not specified)'}"
+    echo "Model: ${model:-'(not specified)'}"
+
+    if [ -z "$output_file" ]; then
+        echo -e "${RED}❌ output_file missing in $config_path${NC}"
+        rm -f "$prepared_config"
+        echo ""
+        return 1
+    fi
     
     # Capture start time for baseline data collection
     local test_start_time=$(get_timestamp)
@@ -305,16 +395,6 @@ run_test() {
     local test_end_time=$(get_timestamp)
     
     # Analyze results if output file exists
-    local output_file=$(grep '"output_file"' "../$config_file" | cut -d'"' -f4)
-    if [ -z "$output_file" ]; then
-        echo -e "${RED}❌ Error: Could not extract output_file from config${NC}"
-        echo "Config file: ../$config_file"
-        echo "Config file content:"
-        cat "../$config_file"
-        rm -f "$prepared_config"
-        return
-    fi
-    
     echo -e "${BLUE}📄 Expected output file: $output_file${NC}"
     echo "Current directory: $(pwd)"
     
@@ -459,7 +539,7 @@ echo ""
 if [ -f "test-timestamps.log" ]; then
     echo "📊 Test timestamps logged in: test-timestamps.log (CSV format)"
     echo "   - Contains precise start/end times for each test"
-    echo "   - Use them to line up telemetry for $FULL_ENDPOINT"
+    echo "   - Use them to line up telemetry for the logged targets"
     echo "   - Metrics to collect: ${BASELINE_METRICS[*]}"
     echo ""
 fi
