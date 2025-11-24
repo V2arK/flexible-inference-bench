@@ -109,11 +109,11 @@ touch concurrency-test-results/test.txt && rm concurrency-test-results/test.txt
 ### 最简单的用法
 
 ```bash
-# 运行完整测试套件（默认行为）
+# 运行扩展测试套件（默认行为，跳过 Peak/Burst）
 ./run-concurrency-tests.sh
 ```
 
-**注意**：这会运行所有测试，包括极端负载测试，可能需要很长时间。
+**注意**：默认仅运行到 Maximum 级别，保持运行时间可控。如需压测 Peak/Burst，请显式执行 `./run-concurrency-tests.sh full`。
 
 ### 推荐的第一步
 
@@ -179,7 +179,7 @@ touch concurrency-test-results/test.txt && rm concurrency-test-results/test.txt
 ./run-concurrency-tests.sh concurrency-low.json
 ./run-concurrency-tests.sh concurrency-medium.json
 
-# 无参数（默认运行完整套件）
+# 无参数（默认运行扩展套件）
 ./run-concurrency-tests.sh
 ```
 

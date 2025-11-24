@@ -1,6 +1,6 @@
 {
     "backend": "openai-grpc",
-    "base_url": "localhost:9000",
+    "base_url": "http://192.168.50.144:9000",
     "model": "Qwen/Qwen2.5-VL-7B-Instruct",
     "seed": 123123,
     "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",

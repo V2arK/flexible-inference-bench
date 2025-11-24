@@ -1,6 +1,6 @@
 {
     "backend": "vllm",
-    "base_url": "http://localhost:8000",
+    "base_url": "http://192.168.50.144:8000",
     "endpoint": "/v1/completions",
     "model": "Qwen/Qwen2.5-VL-7B-Instruct",
     "seed": 123123,

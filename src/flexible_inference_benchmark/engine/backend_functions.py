@@ -86,6 +86,20 @@ def _build_http_session_kwargs(
     return session_kwargs
 
 
+def _build_http_request_headers(
+    request_func_input: RequestFuncInput, base_headers: Optional[Dict[str, str]] = None
+) -> Optional[Dict[str, str]]:
+    """
+    Construct per-request headers, injecting Connection: close when forcing new sockets.
+    """
+    headers: Dict[str, str] = {}
+    if base_headers:
+        headers.update(base_headers)
+    if request_func_input.force_new_http_connection:
+        headers["Connection"] = "close"
+    return headers or None
+
+
 def _normalize_grpc_target(api_url: str) -> str:
     if not api_url:
         raise ValueError("gRPC base URL must be provided.")
@@ -235,7 +249,12 @@ async def async_request_tgi(
         if verbose:
             print_verbose(idx, request_func_input, st, 0, 0, True)
         try:
-            async with session.post(url=api_url, json=payload, ssl=request_func_input.ssl) as response:
+            async with session.post(
+                url=api_url,
+                json=payload,
+                ssl=request_func_input.ssl,
+                headers=_build_http_request_headers(request_func_input),
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -305,7 +324,12 @@ async def async_request_trt_llm(
         if verbose:
             print_verbose(idx, request_func_input, most_recent_timestamp, 0, 0, True)
         try:
-            async with session.post(url=api_url, json=payload, ssl=request_func_input.ssl) as response:
+            async with session.post(
+                url=api_url,
+                json=payload,
+                ssl=request_func_input.ssl,
+                headers=_build_http_request_headers(request_func_input),
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -373,7 +397,10 @@ async def async_request_deepspeed_mii(
             print_verbose(idx, request_func_input, st, 0, 0, True)
         try:
             async with session.post(
-                url=request_func_input.api_url, json=payload, ssl=request_func_input.ssl
+                url=request_func_input.api_url,
+                json=payload,
+                ssl=request_func_input.ssl,
+                headers=_build_http_request_headers(request_func_input),
             ) as response:
                 if response.status == 200:
                     parsed_resp = await response.json()
@@ -424,7 +451,9 @@ async def async_request_openai_completions(
             apply_sampling_params(payload, request_func_input, always_top_p=False)
             if request_func_input.logprobs is not None:
                 payload["logprobs"] = int(request_func_input.logprobs)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            headers = _build_http_request_headers(
+                request_func_input, {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -510,7 +539,9 @@ async def async_request_openai_completions(
             apply_sampling_params(payload, request_func_input, always_top_p=False)
             if request_func_input.logprobs is not None:
                 payload["logprobs"] = int(request_func_input.logprobs)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            headers = _build_http_request_headers(
+                request_func_input, {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            )
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
             output.ttft = 0
@@ -635,10 +666,13 @@ async def async_request_openai_chat_completions(
             if request_func_input.logprobs is not None:
                 payload["logprobs"] = True
                 payload["top_logprobs"] = int(request_func_input.logprobs)
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-            }
+            headers = _build_http_request_headers(
+                request_func_input,
+                {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+                },
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -932,7 +966,9 @@ async def async_request_cserve_debug(
                 "ignore_eos": request_func_input.ignore_eos,
             }
             apply_sampling_params(payload["sampling_params"], request_func_input, always_top_p=False)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            headers = _build_http_request_headers(
+                request_func_input, {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -1002,7 +1038,9 @@ async def async_request_cserve_debug(
                 "stream": False,
             }
             apply_sampling_params(payload["sampling_params"], request_func_input, always_top_p=False)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            headers = _build_http_request_headers(
+                request_func_input, {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -1090,7 +1128,10 @@ async def async_request_profiler(
         if request_func_input.logprobs is not None:
             payload["logprobs"] = True
             payload["top_logprobs"] = int(request_func_input.logprobs)
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        headers = _build_http_request_headers(
+            request_func_input,
+            {"Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+        )
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
