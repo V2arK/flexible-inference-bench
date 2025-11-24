@@ -18,14 +18,15 @@ YELLOW='[1;33m'
 BLUE='[0;34m'
 NC='[0m' # No Color
 
-TARGET=${FIB_GRPC_TARGET:-localhost:9000}
-MODEL_NAME=${FIB_GRPC_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}
-BACKEND_NAME=${FIB_GRPC_BACKEND:-openai-grpc}
+TARGET_OVERRIDE=${FIB_GRPC_TARGET:-}
+MODEL_OVERRIDE=${FIB_GRPC_MODEL:-}
+BACKEND_OVERRIDE=${FIB_GRPC_BACKEND:-}
 
 echo '=== CentML gRPC Concurrency Test Suite ==='
-echo "Target gRPC endpoint: $TARGET"
-echo "Backend flag: $BACKEND_NAME"
-echo "Model: $MODEL_NAME"
+echo "Env override target: ${TARGET_OVERRIDE:-'(from config files)'}"
+echo "Env override backend: ${BACKEND_OVERRIDE:-'(from config files)'}"
+echo "Env override model: ${MODEL_OVERRIDE:-'(from config files)'}"
+echo "Actual targets/models will be logged for each test run."
 echo ''
 
 echo -e "${YELLOW}???? Timestamp logging is enabled for downstream analysis.${NC}"
@@ -98,14 +99,15 @@ from pathlib import Path
 
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
-target = os.environ.get('FIB_GRPC_TARGET', 'localhost:9000')
-backend = os.environ.get('FIB_GRPC_BACKEND', '')
+target_override = os.environ.get('FIB_GRPC_TARGET')
+backend_override = os.environ.get('FIB_GRPC_BACKEND')
 model_override = os.environ.get('FIB_GRPC_MODEL')
 
 data = json.loads(src.read_text())
-data['base_url'] = target
-if backend:
-    data['backend'] = backend
+if target_override:
+    data['base_url'] = target_override
+if backend_override:
+    data['backend'] = backend_override
 if model_override:
     data['model'] = model_override
 
