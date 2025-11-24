@@ -1,34 +1,30 @@
 #!/bin/bash
 
-# CentML gRPC Concurrency Test Suite (Force New Connection)
-# This script runs comprehensive concurrency tests for dummy-vllm's gRPC endpoint
-# with forced new connection for every request.
+# CentML Platform Extended Concurrency Test Suite (4 Replicas)
+# This script runs comprehensive concurrency tests from low to extreme levels
 
 set -e
 
-# Colors for output
+# Colors for output (must be defined before use)
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-TARGET=${FIB_GRPC_TARGET:-localhost:9000}
-MODEL_NAME=${FIB_GRPC_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}
-BACKEND_NAME=${FIB_GRPC_BACKEND:-openai-grpc}
+echo "=== CentML Platform Extended Concurrency Test Suite ==="
+echo "Optimized for 4-replica deployment"
+echo "Testing backend: https://honglintest.d691afed.c-09.centml.com"
+echo "Model: Qwen/Qwen2.5-VL-7B-Instruct"
+echo ""
 
-echo '=== CentML gRPC Concurrency Test Suite (Force New Connection) ==='
-echo "Target gRPC endpoint: $TARGET"
-echo "Backend flag: $BACKEND_NAME"
-echo "Model: $MODEL_NAME"
-echo ''
-
-echo -e "${YELLOW}📝 Timestamp logging is enabled for downstream analysis.${NC}"
-echo ''
-
-echo -e "${GREEN}✅ Results will be stored under concurrency-test-results/${NC}"
-
-echo ''
+echo -e "${YELLOW}📝 Timestamp Logging for Manual API Data Collection:${NC}"
+echo "Test timestamps will be logged for manual single-replica data collection."
+echo "After tests complete, use the timestamps to manually retrieve baseline data from:"
+echo "https://api.centml.com/deployments/usage/4186"
+echo ""
+echo -e "${GREEN}✅ Test timestamps will be logged for manual API data collection${NC}"
+echo ""
 
 # Create results directory
 mkdir -p concurrency-test-results
@@ -48,6 +44,37 @@ BASELINE_METRICS=(
     "cpu"
     "memory"
 )
+
+# Function to prepare config file (similar to grpc version)
+# This allows environment variable overrides for flexibility
+prepare_config() {
+    local original_config=$1
+    local tmp_config
+    tmp_config=$(mktemp)
+    python3 - <<'PY' "$original_config" "$tmp_config"
+import json
+import os
+import sys
+from pathlib import Path
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+base_url_override = os.environ.get('FIB_BASE_URL')
+backend_override = os.environ.get('FIB_BACKEND')
+model_override = os.environ.get('FIB_MODEL')
+
+data = json.loads(src.read_text())
+if base_url_override:
+    data['base_url'] = base_url_override
+if backend_override:
+    data['backend'] = backend_override
+if model_override:
+    data['model'] = model_override
+
+dst.write_text(json.dumps(data, indent=4))
+PY
+    echo "$tmp_config"
+}
 
 # Function to log test timestamps for manual API data collection
 log_test_timestamps() {
@@ -85,34 +112,6 @@ log_test_timestamps() {
     echo -e "${GREEN}✅ Logged to $timestamp_file${NC}"
 }
 
-prepare_config() {
-    local original_config=$1
-    local tmp_config
-    tmp_config=$(mktemp)
-    python - <<'PY' "$original_config" "$tmp_config"
-import json
-import os
-import sys
-from pathlib import Path
-
-src = Path(sys.argv[1])
-dst = Path(sys.argv[2])
-target = os.environ.get('FIB_GRPC_TARGET', 'localhost:9000')
-backend = os.environ.get('FIB_GRPC_BACKEND', '')
-model_override = os.environ.get('FIB_GRPC_MODEL')
-
-data = json.loads(src.read_text())
-data['base_url'] = target
-if backend:
-    data['backend'] = backend
-if model_override:
-    data['model'] = model_override
-
-dst.write_text(json.dumps(data, indent=4))
-PY
-    echo "$tmp_config"
-}
-
 # Function to generate a summary report with timestamps for manual data collection
 generate_comparison_summary() {
     if [ ! -f "test-timestamps.log" ]; then
@@ -129,9 +128,9 @@ generate_comparison_summary() {
 Generated: $(date)
 
 ## Test Configuration
-- **gRPC Endpoint**: $TARGET
-- **Backend Flag**: $BACKEND_NAME
-- **Model**: $MODEL_NAME
+- **4-Replica Deployment**: https://honglintest.d691afed.c-09.centml.com
+- **Single Replica Baseline**: Deployment ID $SINGLE_REPLICA_DEPLOYMENT_ID
+- **Model**: Qwen/Qwen2.5-VL-7B-Instruct
 
 ## Data Files
 
@@ -147,11 +146,15 @@ EOF
     
     cat >> "$summary_file" << EOF
 
-### Test Timestamps for Manual Data Collection
+### Test Timestamps for Manual API Data Collection
 - test-timestamps.log (CSV format: test_name,start_time,end_time,duration_seconds)
 
-### Manual Data Collection
-Use the timestamps in test-timestamps.log to align telemetry from your monitoring backend of choice.
+### Manual API Data Collection
+Use the timestamps in test-timestamps.log to collect single-replica baseline data:
+1. Get bearer token from https://app.centml.com (Developer Tools)
+2. For each metric, query https://api.centml.com/deployments/usage/4186 for full timeline
+3. Paste each metric's API response into the corresponding baseline-data file
+4. Use timestamps to extract test-specific sections during analysis
 
 ### Metric Files Created (one per metric)
 EOF
@@ -260,6 +263,7 @@ run_test() {
         echo "Continuing automatically..."
     fi
     
+    # Prepare config file (allows environment variable overrides)
     local prepared_config
     prepared_config=$(prepare_config "../$config_file")
     
@@ -268,7 +272,7 @@ run_test() {
     
     # Run benchmark
     echo -e "${GREEN}🚀 Starting test...${NC}"
-    if fib benchmark --config-file "$prepared_config" --force-new-grpc-connection; then
+    if fib benchmark --config-file "$prepared_config"; then
         echo -e "${GREEN}✅ Test completed successfully${NC}"
     else
         echo -e "${RED}❌ Test failed or encountered errors${NC}"
@@ -292,7 +296,7 @@ run_test() {
         return
     fi
     
-    echo -e "${BLUE}📄 Expected output file: $output_file${NC}"
+    echo -e "${BLUE}📊 Expected output file: $output_file${NC}"
     echo "Current directory: $(pwd)"
     
     if [ -f "$output_file" ]; then
@@ -313,16 +317,15 @@ run_test() {
         echo ""
     fi
     
+    # Clean up prepared config
+    rm -f "$prepared_config"
+    
     # Log test timestamps for manual API data collection
     log_test_timestamps "$test_start_time" "$test_end_time" "$test_name"
-    
-    rm -f "$prepared_config"
     
     # Small delay between tests
     sleep 3
 }
-
-
 
 # Test suite functions
 
@@ -436,7 +439,7 @@ echo ""
 if [ -f "test-timestamps.log" ]; then
     echo "📊 Test timestamps logged in: test-timestamps.log (CSV format)"
     echo "   - Contains precise start/end times for each test"
-    echo "   - Use them to line up telemetry for $TARGET"
+    echo "   - Deployment ID for single-replica data: $SINGLE_REPLICA_DEPLOYMENT_ID"  
     echo "   - Metrics to collect: ${BASELINE_METRICS[*]}"
     echo ""
 fi
@@ -445,6 +448,9 @@ echo "fib generate-ttft-plot --files *.json"
 echo ""
 echo "Analyze specific results:"
 echo "fib analyse <result-file.json>"
+echo ""
+echo "To collect baseline data, set environment variable:"
+echo "export CENTML_API_TOKEN='your_bearer_token_here'"
 echo ""
 echo "Metric data files to populate:"
 echo "  - baseline-data/http_requests.json"

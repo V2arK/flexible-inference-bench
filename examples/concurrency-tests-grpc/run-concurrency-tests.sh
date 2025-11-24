@@ -22,10 +22,10 @@ echo "Backend flag: $BACKEND_NAME"
 echo "Model: $MODEL_NAME"
 echo ''
 
-echo -e "${YELLOW}üìù Timestamp logging is enabled for downstream analysis.${NC}"
+echo -e "${YELLOW}???? Timestamp logging is enabled for downstream analysis.${NC}"
 echo ''
 
-echo -e "${GREEN}‚úÖ Results will be stored under concurrency-test-results/${NC}"
+echo -e "${GREEN}‚?? Results will be stored under concurrency-test-results/${NC}"
 
 echo ''
 
@@ -54,7 +54,7 @@ log_test_timestamps() {
     local end_time=$2
     local test_name=$3
     
-    echo -e "${BLUE}üìä Logging timestamps for $test_name...${NC}"
+    echo -e "${BLUE}???? Logging timestamps for $test_name...${NC}"
     
     # Create timestamp log file
     local timestamp_file="test-timestamps.log"
@@ -81,7 +81,7 @@ log_test_timestamps() {
     echo "   End: $end_time ($(date -r $end_time '+%H:%M:%S'))" 
     echo "   Duration: $(($end_time - $start_time))s"
     
-    echo -e "${GREEN}‚úÖ Logged to $timestamp_file${NC}"
+    echo -e "${GREEN}‚?? Logged to $timestamp_file${NC}"
 }
 
 prepare_config() {
@@ -115,11 +115,11 @@ PY
 # Function to generate a summary report with timestamps for manual data collection
 generate_comparison_summary() {
     if [ ! -f "test-timestamps.log" ]; then
-        echo -e "${YELLOW}‚ö†Ô∏è  No timestamp log found. Skipping comparison summary.${NC}"
+        echo -e "${YELLOW}‚?†?∏?  No timestamp log found. Skipping comparison summary.${NC}"
         return
     fi
     
-    echo -e "${BLUE}üìà Generating comparison summary report...${NC}"
+    echo -e "${BLUE}???? Generating comparison summary report...${NC}"
     
     local summary_file="comparison-summary.md"
     cat > "$summary_file" << EOF
@@ -196,7 +196,7 @@ The baseline data files can be used to create comparison charts showing:
 - Scraped Data: $(ls -1 *.json 2>/dev/null | grep -v results | wc -l) files
 EOF
     
-    echo -e "${GREEN}‚úÖ Comparison summary saved to $summary_file${NC}"
+    echo -e "${GREEN}‚?? Comparison summary saved to $summary_file${NC}"
 }
 
 # Function to get current timestamp
@@ -255,7 +255,7 @@ run_test() {
     echo "Configuration: $config_file"
     
     if [ ! -z "$warning_msg" ]; then
-        echo -e "${YELLOW}‚ö†Ô∏è  WARNING: $warning_msg${NC}"
+        echo -e "${YELLOW}‚?†?∏?  WARNING: $warning_msg${NC}"
         echo "Continuing automatically..."
     fi
     
@@ -266,11 +266,11 @@ run_test() {
     local test_start_time=$(get_timestamp)
     
     # Run benchmark
-    echo -e "${GREEN}üöÄ Starting test...${NC}"
+    echo -e "${GREEN}???? Starting test...${NC}"
     if fib benchmark --config-file "$prepared_config"; then
-        echo -e "${GREEN}‚úÖ Test completed successfully${NC}"
+        echo -e "${GREEN}‚?? Test completed successfully${NC}"
     else
-        echo -e "${RED}‚ùå Test failed or encountered errors${NC}"
+        echo -e "${RED}‚?? Test failed or encountered errors${NC}"
         echo "Check the logs above for details"
         echo ""
         rm -f "$prepared_config"
@@ -281,13 +281,34 @@ run_test() {
     local test_end_time=$(get_timestamp)
     
     # Analyze results if output file exists
-    local output_file=$(grep '"output_file"' "$prepared_config" | cut -d'"' -f4)
+    local output_file=$(grep '"output_file"' "../$config_file" | cut -d'"' -f4)
+    if [ -z "$output_file" ]; then
+        echo -e "${RED}? Error: Could not extract output_file from config${NC}"
+        echo "Config file: ../$config_file"
+        echo "Config file content:"
+        cat "../$config_file"
+        rm -f "$prepared_config"
+        return
+    fi
+    
+    echo -e "${BLUE}???? Expected output file: $output_file${NC}"
+    echo "Current directory: $(pwd)"
+    
     if [ -f "$output_file" ]; then
         echo ""
-        echo -e "${BLUE}üìä Results for $test_name:${NC}"
+        echo -e "${BLUE}???? Results for $test_name:${NC}"
         fib analyse "$output_file"
         echo ""
         echo "-----------------------------------"
+        echo ""
+    else
+        echo -e "${YELLOW}‚?†?∏?  Warning: Output file '$output_file' not found after benchmark${NC}"
+        echo "Current directory: $(pwd)"
+        echo "Files in current directory:"
+        ls -la | head -10
+        echo ""
+        echo "Checking if file exists elsewhere..."
+        find .. -name "$output_file" -type f 2>/dev/null | head -5 || echo "File not found in parent directories"
         echo ""
     fi
     
@@ -326,7 +347,7 @@ run_extended_suite() {
 }
 
 run_full_suite() {
-    echo -e "${RED}‚ö†Ô∏è  FULL SUITE WARNING ‚ö†Ô∏è${NC}"
+    echo -e "${RED}‚?†?∏?  FULL SUITE WARNING ‚?†?∏?${NC}"
     echo "This includes PEAK and BURST tests with 750-1000+ concurrent requests"
     echo "These tests may overwhelm your backend and cause failures"
     echo "Recommended only for performance limit testing"
@@ -387,11 +408,11 @@ else
             echo "Usage: $0 [suite-type|test-file.json]"
             echo ""
             echo "Suite types:"
-            echo "  1/basic     - Basic Suite (Low ‚Üí High)"
-            echo "  2/standard  - Standard Suite (Low ‚Üí Stress)"
-            echo "  3/extended  - Extended Suite (Low ‚Üí Maximum)"
+            echo "  1/basic     - Basic Suite (Low ‚?? High)"
+            echo "  2/standard  - Standard Suite (Low ‚?? Stress)"
+            echo "  3/extended  - Extended Suite (Low ‚?? Maximum)"
             echo "  4/full      - Full Suite (All tests including Peak/Burst)"
-            echo "  5/high-load - High-Load Only (Ultra ‚Üí Burst)"
+            echo "  5/high-load - High-Load Only (Ultra ‚?? Burst)"
             echo ""
             echo "Single test files:"
             echo "  concurrency-low.json, concurrency-medium.json, etc."
@@ -412,7 +433,7 @@ echo "=== Final Notes ==="
 echo "All results saved in: concurrency-test-results/"
 echo ""
 if [ -f "test-timestamps.log" ]; then
-    echo "üìä Test timestamps logged in: test-timestamps.log (CSV format)"
+    echo "???? Test timestamps logged in: test-timestamps.log (CSV format)"
     echo "   - Contains precise start/end times for each test"
     echo "   - Use them to line up telemetry for $TARGET"
     echo "   - Metrics to collect: ${BASELINE_METRICS[*]}"
