@@ -1,6 +1,6 @@
 # mypy: disable-error-code="attr-defined"
 import os
-from typing import Optional
+from typing import Dict, List, Optional, Union
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME, get_aggregated_resources
@@ -45,8 +45,8 @@ def setup_telemetry() -> None:
 
 
 def create_span_attributes(
-    prompt_tokens: int, image_count: int, image_sizes: list[int], response_tokens: int, run_id: str
-) -> dict[str, int | list[int] | str]:
+    prompt_tokens: int, image_count: int, image_sizes: List[int], response_tokens: int, run_id: str
+) -> Dict[str, Union[int, List[int], str]]:
     """
     Create a dictionary of span attributes for a request.
     All attributes are prefixed with 'fib.' for easy identification.
