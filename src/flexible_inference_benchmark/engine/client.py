@@ -51,6 +51,7 @@ class Client:
         include_schema_in_prompt: bool = False,
         force_new_grpc_connection: bool = False,
         force_new_http_connection: bool = False,
+        http_connection_pool_limit: Optional[int] = None,
     ):
         self.backend = backend
         self.api_url = api_url
@@ -80,6 +81,7 @@ class Client:
         self.include_schema_in_prompt = include_schema_in_prompt
         self.force_new_grpc_connection = force_new_grpc_connection
         self.force_new_http_connection = force_new_http_connection
+        self.http_connection_pool_limit = http_connection_pool_limit
 
     @property
     def request_func(
@@ -199,6 +201,7 @@ class Client:
                 include_schema_in_prompt=self.include_schema_in_prompt,
                 force_new_grpc_connection=self.force_new_grpc_connection,
                 force_new_http_connection=self.force_new_http_connection,
+                http_connection_pool_limit=self.http_connection_pool_limit,
             )
             for (data_sample, media_sample) in zip(data, requests_media)
         ]
@@ -250,6 +253,7 @@ class Client:
             include_schema_in_prompt=self.include_schema_in_prompt,
             force_new_grpc_connection=self.force_new_grpc_connection,
             force_new_http_connection=self.force_new_http_connection,
+            http_connection_pool_limit=self.http_connection_pool_limit,
         )
         return await self.send_request(-1, data, 0, None, None)
 
@@ -279,6 +283,7 @@ class Client:
             include_schema_in_prompt=self.include_schema_in_prompt,
             force_new_grpc_connection=self.force_new_grpc_connection,
             force_new_http_connection=self.force_new_http_connection,
+            http_connection_pool_limit=self.http_connection_pool_limit,
         )
         return await self.signal_profiler(0, data, 0, None, None)
 
@@ -308,5 +313,6 @@ class Client:
             include_schema_in_prompt=self.include_schema_in_prompt,
             force_new_grpc_connection=self.force_new_grpc_connection,
             force_new_http_connection=self.force_new_http_connection,
+            http_connection_pool_limit=self.http_connection_pool_limit,
         )
         return await self.signal_profiler(0, data, 0, None, None)

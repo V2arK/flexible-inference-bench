@@ -557,6 +557,15 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
         help="Force HTTP requests to close sockets after every response (disable keep-alive).",
     )
 
+    benchmark_parser.add_argument(
+        "--http-connection-pool-limit",
+        type=int,
+        default=None,
+        help="Set the aiohttp TCPConnector connection pool limit (default: 100). "
+        "Increase this value for high-concurrency benchmarks to avoid connection pool bottlenecks. "
+        "Ignored when --force-new-http-connection is set.",
+    )
+
     return benchmark_parser
 
 
@@ -912,6 +921,7 @@ def run_main(args: argparse.Namespace) -> None:
             include_schema_in_prompt=getattr(args, 'include_schema_in_prompt', False),
             force_new_grpc_connection=getattr(args, 'force_new_grpc_connection', False),
             force_new_http_connection=getattr(args, 'force_new_http_connection', False),
+            http_connection_pool_limit=getattr(args, 'http_connection_pool_limit', None),
         )
         # disable verbose output for validation of the endpoint. This is done to avoid confusion on terminal output.
         client_verbose_value = client.verbose

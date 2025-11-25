@@ -16,5 +16,6 @@
     "temperature": 0.0,
     "disable_stream": false,
     "num_validation_reqs": 3,
-    "output_file": "concurrency-test-results.json"
+    "output_file": "concurrency-test-results.json",
+    "http_connection_pool_limit": 1000
 }

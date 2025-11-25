@@ -57,6 +57,7 @@ class RequestFuncInput(BaseModel):
     include_schema_in_prompt: bool = False
     force_new_grpc_connection: bool = False
     force_new_http_connection: bool = False
+    http_connection_pool_limit: Optional[int] = None
 
 
 class RequestFuncOutput(BaseModel):
@@ -83,6 +84,11 @@ def _build_http_session_kwargs(
         session_kwargs["cookies"] = cookies
     if request_func_input.force_new_http_connection:
         session_kwargs["connector"] = aiohttp.TCPConnector(force_close=True)
+    elif request_func_input.http_connection_pool_limit is not None:
+        session_kwargs["connector"] = aiohttp.TCPConnector(
+            limit=request_func_input.http_connection_pool_limit,
+            limit_per_host=request_func_input.http_connection_pool_limit,
+        )
     return session_kwargs
 
 
