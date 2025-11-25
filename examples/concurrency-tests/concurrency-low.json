@@ -9,7 +9,10 @@
     "num_of_req": 10,
     "max_concurrent": 2,
     "request_rate": 4,
-    "request_distribution": ["poisson", 5],
+    "request_distribution": [
+        "poisson",
+        4
+    ],
     "temperature": 0.0,
     "disable_stream": false,
     "num_validation_reqs": 2,
