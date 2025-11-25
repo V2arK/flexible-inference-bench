@@ -484,11 +484,8 @@ async def async_request_openai_completions(
                             chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
                             if chunk == "[DONE]":
                                 latency = time.perf_counter() - st
-                            elif chunk:
-                                try:
-                                    data = json.loads(chunk)
-                                except json.JSONDecodeError:
-                                    continue
+                            else:
+                                data = json.loads(chunk)
 
                                 if len(data["choices"]) > 0 and data["choices"][0]["text"] is not None:
                                     timestamp = time.perf_counter()
@@ -507,7 +504,7 @@ async def async_request_openai_completions(
                                     most_recent_timestamp = timestamp
                                     generated_text += data["choices"][0]["text"]
 
-                                if data.get("usage"):
+                                if data["usage"]:
                                     if "completion_tokens" in data["usage"]:
                                         output.output_len = int(data["usage"]["completion_tokens"])
                                     if "prompt_tokens" in data["usage"]:
