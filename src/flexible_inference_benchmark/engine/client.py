@@ -9,9 +9,13 @@ from flexible_inference_benchmark.engine.backend_functions import (
     ASYNC_REQUEST_FUNCS,
     RequestFuncInput,
     RequestFuncOutput,
+    initialize_grpc_channel_pool,
+    close_grpc_channel_pools,
 )
 
 logger = logging.getLogger(__name__)
+
+GRPC_BACKENDS = {"openai-grpc", "vllm-grpc", "openai-chat-grpc"}
 
 
 class WaveState:
@@ -51,7 +55,6 @@ class Client:
         include_schema_in_prompt: bool = False,
         force_new_grpc_connection: bool = False,
         force_new_http_connection: bool = False,
-        http_connection_pool_limit: Optional[int] = None,
     ):
         self.backend = backend
         self.api_url = api_url
@@ -81,7 +84,6 @@ class Client:
         self.include_schema_in_prompt = include_schema_in_prompt
         self.force_new_grpc_connection = force_new_grpc_connection
         self.force_new_http_connection = force_new_http_connection
-        self.http_connection_pool_limit = http_connection_pool_limit
 
     @property
     def request_func(
@@ -175,6 +177,14 @@ class Client:
         assert len(data) == len(requests_media), "Data and request media must have the same length"
         pbar = None if self.disable_tqdm else tqdm(total=len(data))
 
+        # Initialize connection pools based on backend type
+        if self.backend in GRPC_BACKENDS and not self.force_new_grpc_connection:
+            pool_size = self.max_concurrent if self.max_concurrent else 1
+            logger.info(f"Initializing gRPC channel pool with {pool_size} channels (matching max_concurrent)")
+            await initialize_grpc_channel_pool(self.api_url, pool_size)
+        elif self.max_concurrent is not None:
+            logger.info(f"HTTP connection pool limit set to {self.max_concurrent} (matching max_concurrent)")
+
         request_func_inputs = [
             RequestFuncInput(
                 prompt=data_sample[0],
@@ -201,29 +211,34 @@ class Client:
                 include_schema_in_prompt=self.include_schema_in_prompt,
                 force_new_grpc_connection=self.force_new_grpc_connection,
                 force_new_http_connection=self.force_new_http_connection,
-                http_connection_pool_limit=self.http_connection_pool_limit,
+                http_connection_pool_limit=self.max_concurrent,
             )
             for (data_sample, media_sample) in zip(data, requests_media)
         ]
 
-        if self.wave:
-            sema = asyncio.Semaphore(self.wave_max)
-            wave_state = WaveState()
-            return await asyncio.gather(
-                *[
-                    self.send_wave_request(idx, data, request_time, pbar, sema, wave_state)
-                    for idx, (data, request_time) in enumerate(zip(request_func_inputs, request_times))
-                ]
-            )
+        try:
+            if self.wave:
+                sema = asyncio.Semaphore(self.wave_max)
+                wave_state = WaveState()
+                return await asyncio.gather(
+                    *[
+                        self.send_wave_request(idx, data, request_time, pbar, sema, wave_state)
+                        for idx, (data, request_time) in enumerate(zip(request_func_inputs, request_times))
+                    ]
+                )
 
-        else:
-            b_sema = asyncio.BoundedSemaphore(self.max_concurrent) if self.max_concurrent else None
-            return await asyncio.gather(
-                *[
-                    self.send_request(idx, data, request_time, pbar, b_sema)
-                    for idx, (data, request_time) in enumerate(zip(request_func_inputs, request_times))
-                ]
-            )
+            else:
+                b_sema = asyncio.BoundedSemaphore(self.max_concurrent) if self.max_concurrent else None
+                return await asyncio.gather(
+                    *[
+                        self.send_request(idx, data, request_time, pbar, b_sema)
+                        for idx, (data, request_time) in enumerate(zip(request_func_inputs, request_times))
+                    ]
+                )
+        finally:
+            # Clean up gRPC channel pools after benchmark completes
+            if self.backend in GRPC_BACKENDS and not self.force_new_grpc_connection:
+                await close_grpc_channel_pools()
 
     async def validate_url_endpoint(
         self, request: Tuple[str, int, int], media_item: List[str]
@@ -253,7 +268,7 @@ class Client:
             include_schema_in_prompt=self.include_schema_in_prompt,
             force_new_grpc_connection=self.force_new_grpc_connection,
             force_new_http_connection=self.force_new_http_connection,
-            http_connection_pool_limit=self.http_connection_pool_limit,
+            http_connection_pool_limit=self.max_concurrent,
         )
         return await self.send_request(-1, data, 0, None, None)
 
@@ -283,7 +298,7 @@ class Client:
             include_schema_in_prompt=self.include_schema_in_prompt,
             force_new_grpc_connection=self.force_new_grpc_connection,
             force_new_http_connection=self.force_new_http_connection,
-            http_connection_pool_limit=self.http_connection_pool_limit,
+            http_connection_pool_limit=self.max_concurrent,
         )
         return await self.signal_profiler(0, data, 0, None, None)
 
@@ -313,6 +328,6 @@ class Client:
             include_schema_in_prompt=self.include_schema_in_prompt,
             force_new_grpc_connection=self.force_new_grpc_connection,
             force_new_http_connection=self.force_new_http_connection,
-            http_connection_pool_limit=self.http_connection_pool_limit,
+            http_connection_pool_limit=self.max_concurrent,
         )
         return await self.signal_profiler(0, data, 0, None, None)

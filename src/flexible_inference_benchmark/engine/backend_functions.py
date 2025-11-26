@@ -2,6 +2,7 @@
 # pylint: disable=too-many-positional-arguments
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
@@ -24,6 +25,7 @@ AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 # Get the tracer
 tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 
 class bcolors:
@@ -71,9 +73,118 @@ class RequestFuncOutput(BaseModel):
     output_len: Optional[int] = None
 
 
+class GrpcChannelPool:
+    """
+    A pool of gRPC channels for load distribution across multiple HTTP/2 connections.
+    
+    This helps avoid HOL blocking and improves throughput at high concurrency by
+    distributing requests across multiple channels instead of multiplexing everything
+    on a single HTTP/2 connection.
+    """
+    
+    def __init__(self, target: str, pool_size: int = 1) -> None:
+        self._target = target
+        self._pool_size = max(1, pool_size)
+        self._channels: List[grpc.aio.Channel] = []
+        self._stubs: List[openai_pb2_grpc.VLLMServiceStub] = []
+        self._index = 0
+        self._lock = asyncio.Lock()
+        self._initialized = False
+    
+    async def initialize(self) -> None:
+        """Initialize all channels in the pool."""
+        async with self._lock:
+            if self._initialized:
+                return
+            
+            logger.info(f"Initializing gRPC channel pool with {self._pool_size} channels to {self._target}")
+            
+            for i in range(self._pool_size):
+                channel = grpc.aio.insecure_channel(self._target)
+                await channel.channel_ready()
+                stub = openai_pb2_grpc.VLLMServiceStub(channel)
+                self._channels.append(channel)
+                self._stubs.append(stub)
+                logger.debug(f"gRPC channel {i + 1}/{self._pool_size} ready")
+            
+            self._initialized = True
+            logger.info(f"gRPC channel pool initialized: {self._pool_size} channels ready")
+    
+    def get_stub(self) -> openai_pb2_grpc.VLLMServiceStub:
+        """Get the next stub using round-robin selection."""
+        if not self._initialized or not self._stubs:
+            raise RuntimeError("GrpcChannelPool not initialized. Call initialize() first.")
+        
+        # Thread-safe round-robin (atomic increment with modulo)
+        idx = self._index % self._pool_size
+        self._index += 1
+        return self._stubs[idx]
+    
+    async def close(self) -> None:
+        """Close all channels in the pool."""
+        async with self._lock:
+            for channel in self._channels:
+                await channel.close()
+            self._channels.clear()
+            self._stubs.clear()
+            self._initialized = False
+            self._index = 0
+            logger.info("gRPC channel pool closed")
+    
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+    
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+
+# Global channel pool registry: target -> pool
+_GRPC_CHANNEL_POOLS: Dict[str, GrpcChannelPool] = {}
+_GRPC_POOL_LOCK = asyncio.Lock()
+
+# Legacy single-channel storage (kept for backward compatibility)
 _GRPC_STUBS: Dict[Tuple[str, int], openai_pb2_grpc.VLLMServiceStub] = {}
 _GRPC_CHANNELS: Dict[Tuple[str, int], grpc.aio.Channel] = {}
 _GRPC_STUB_LOCK = asyncio.Lock()
+
+
+async def initialize_grpc_channel_pool(api_url: str, pool_size: int) -> GrpcChannelPool:
+    """
+    Initialize a gRPC channel pool for the given target URL.
+    
+    Args:
+        api_url: The gRPC server URL (e.g., "grpc://localhost:9000")
+        pool_size: Number of channels in the pool (typically matches max_concurrent)
+    
+    Returns:
+        The initialized GrpcChannelPool instance.
+    """
+    target = _normalize_grpc_target(api_url)
+    
+    async with _GRPC_POOL_LOCK:
+        if target in _GRPC_CHANNEL_POOLS:
+            existing_pool = _GRPC_CHANNEL_POOLS[target]
+            if existing_pool.is_initialized:
+                if existing_pool.pool_size == pool_size:
+                    return existing_pool
+                # Pool size changed, close old pool and create new one
+                await existing_pool.close()
+        
+        pool = GrpcChannelPool(target, pool_size)
+        await pool.initialize()
+        _GRPC_CHANNEL_POOLS[target] = pool
+        return pool
+
+
+async def close_grpc_channel_pools() -> None:
+    """Close all gRPC channel pools."""
+    async with _GRPC_POOL_LOCK:
+        for pool in _GRPC_CHANNEL_POOLS.values():
+            await pool.close()
+        _GRPC_CHANNEL_POOLS.clear()
+        logger.info("All gRPC channel pools closed")
 
 
 def _build_http_session_kwargs(
@@ -82,13 +193,19 @@ def _build_http_session_kwargs(
     session_kwargs: Dict[str, Any] = {"timeout": AIOHTTP_TIMEOUT}
     if cookies:
         session_kwargs["cookies"] = cookies
+    
+    # Build TCPConnector with appropriate settings
+    connector_kwargs: Dict[str, Any] = {}
+    
     if request_func_input.force_new_http_connection:
-        session_kwargs["connector"] = aiohttp.TCPConnector(force_close=True)
-    elif request_func_input.http_connection_pool_limit is not None:
-        session_kwargs["connector"] = aiohttp.TCPConnector(
-            limit=request_func_input.http_connection_pool_limit,
-            limit_per_host=request_func_input.http_connection_pool_limit,
-        )
+        connector_kwargs["force_close"] = True
+    
+    if request_func_input.http_connection_pool_limit is not None:
+        connector_kwargs["limit"] = request_func_input.http_connection_pool_limit
+    
+    if connector_kwargs:
+        session_kwargs["connector"] = aiohttp.TCPConnector(**connector_kwargs)
+    
     return session_kwargs
 
 
@@ -134,6 +251,14 @@ async def _get_grpc_stub(api_url: str, force_new_connection: bool = False) -> Tu
         stub = openai_pb2_grpc.VLLMServiceStub(channel)
         return stub, channel
 
+    # Try to use channel pool first (if initialized)
+    if target in _GRPC_CHANNEL_POOLS:
+        pool = _GRPC_CHANNEL_POOLS[target]
+        if pool.is_initialized:
+            stub = pool.get_stub()
+            return stub, None  # No channel to close, pool manages lifecycle
+
+    # Fallback to legacy single-channel behavior
     loop = asyncio.get_running_loop()
     key = (target, id(loop))
     async with _GRPC_STUB_LOCK:
