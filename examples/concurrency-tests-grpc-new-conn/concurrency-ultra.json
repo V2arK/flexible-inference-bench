@@ -1,6 +1,6 @@
 {
     "backend": "openai-grpc",
-    "base_url": "http://10.28.115.40:8000",
+    "base_url": "grpc://localhost:9000",
     "model": "Qwen/Qwen2.5-VL-7B-Instruct",
     "seed": 123123,
     "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",
@@ -8,8 +8,10 @@
     "num_of_req": 750,
     "max_concurrent": 150,
     "request_rate": 300,
-    "request_distribution": ["poisson", 300],
-
+    "request_distribution": [
+        "poisson",
+        300
+    ],
     "temperature": 0.0,
     "disable_stream": false,
     "num_validation_reqs": 5,
