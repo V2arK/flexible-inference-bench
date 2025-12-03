@@ -150,6 +150,176 @@ _GRPC_CHANNELS: Dict[Tuple[str, int], grpc.aio.Channel] = {}
 _GRPC_STUB_LOCK = asyncio.Lock()
 
 
+class HttpSessionPool:
+    """
+    A pool of HTTP sessions for efficient connection reuse.
+    
+    Unlike creating a new ClientSession per request, this pool maintains
+    a shared session with a properly configured connection pool, allowing
+    true connection reuse across requests.
+    
+    This addresses the architectural issue where each request was creating
+    a new ClientSession, preventing effective connection pooling even when
+    TCPConnector was configured with a limit parameter.
+    """
+    
+    def __init__(self, pool_size: int = 100, force_close: bool = False) -> None:
+        self._pool_size = max(1, pool_size)
+        self._force_close = force_close
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._lock = asyncio.Lock()
+        self._initialized = False
+    
+    async def initialize(self) -> None:
+        """Initialize the shared session with connection pool."""
+        async with self._lock:
+            if self._initialized:
+                return
+            
+            connector_kwargs: Dict[str, Any] = {
+                "limit": self._pool_size,
+            }
+            if self._force_close:
+                connector_kwargs["force_close"] = True
+            
+            connector = aiohttp.TCPConnector(**connector_kwargs)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=AIOHTTP_TIMEOUT,
+            )
+            self._initialized = True
+            logger.info(f"HTTP session pool initialized with limit={self._pool_size}, force_close={self._force_close}")
+    
+    def get_session(self) -> aiohttp.ClientSession:
+        """Get the shared session."""
+        if not self._initialized or self._session is None:
+            raise RuntimeError("HttpSessionPool not initialized. Call initialize() first.")
+        return self._session
+    
+    async def close(self) -> None:
+        """Close the shared session."""
+        async with self._lock:
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
+            self._initialized = False
+            logger.info("HTTP session pool closed")
+    
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+    
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+
+# Global HTTP session pool registry: base_url -> pool
+_HTTP_SESSION_POOLS: Dict[str, HttpSessionPool] = {}
+_HTTP_POOL_LOCK = asyncio.Lock()
+
+
+async def initialize_http_session_pool(base_url: str, pool_size: int, force_close: bool = False) -> HttpSessionPool:
+    """
+    Initialize an HTTP session pool for the given base URL.
+    
+    Args:
+        base_url: The base URL for the HTTP server
+        pool_size: Number of connections in the pool (typically matches max_concurrent)
+        force_close: If True, forces connections to close after each request
+    
+    Returns:
+        The initialized HttpSessionPool instance.
+    """
+    async with _HTTP_POOL_LOCK:
+        if base_url in _HTTP_SESSION_POOLS:
+            existing_pool = _HTTP_SESSION_POOLS[base_url]
+            if existing_pool.is_initialized:
+                if existing_pool.pool_size == pool_size:
+                    return existing_pool
+                # Pool size changed, close old pool and create new one
+                await existing_pool.close()
+        
+        pool = HttpSessionPool(pool_size, force_close)
+        await pool.initialize()
+        _HTTP_SESSION_POOLS[base_url] = pool
+        return pool
+
+
+async def close_http_session_pools() -> None:
+    """Close all HTTP session pools."""
+    async with _HTTP_POOL_LOCK:
+        for pool in _HTTP_SESSION_POOLS.values():
+            await pool.close()
+        _HTTP_SESSION_POOLS.clear()
+        logger.info("All HTTP session pools closed")
+
+
+def get_http_session_pool(base_url: str) -> Optional[HttpSessionPool]:
+    """Get an existing HTTP session pool for the given base URL, if any."""
+    return _HTTP_SESSION_POOLS.get(base_url)
+
+
+def _extract_base_url(api_url: str) -> str:
+    """Extract base URL (scheme://host:port) from a full API URL."""
+    parsed = urlparse(api_url)
+    port_part = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port_part}"
+
+
+class _HttpSessionContext:
+    """
+    Context manager for HTTP session handling.
+    
+    If a shared session pool exists, uses the pooled session (no cleanup on exit).
+    Otherwise, creates a new session and cleans it up on exit.
+    """
+    
+    def __init__(self, request_func_input: RequestFuncInput, cookies: Optional[Dict[str, str]] = None):
+        self._request_func_input = request_func_input
+        self._cookies = cookies
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._owns_session = False  # True if we created the session and need to close it
+    
+    async def __aenter__(self) -> aiohttp.ClientSession:
+        # If force_new_http_connection is requested, always create a new session
+        if self._request_func_input.force_new_http_connection:
+            self._session = aiohttp.ClientSession(
+                **_build_http_session_kwargs(self._request_func_input, self._cookies)
+            )
+            self._owns_session = True
+            return self._session
+        
+        # If cookies are provided, create a new session to ensure cookies are applied
+        # (shared session pool doesn't support per-request cookies)
+        if self._cookies:
+            self._session = aiohttp.ClientSession(
+                **_build_http_session_kwargs(self._request_func_input, self._cookies)
+            )
+            self._owns_session = True
+            return self._session
+        
+        # Try to use shared session pool
+        base_url = _extract_base_url(self._request_func_input.api_url)
+        pool = get_http_session_pool(base_url)
+        
+        if pool is not None and pool.is_initialized:
+            self._session = pool.get_session()
+            self._owns_session = False
+            return self._session
+        
+        # Fallback: create a new session (legacy behavior)
+        self._session = aiohttp.ClientSession(
+            **_build_http_session_kwargs(self._request_func_input, self._cookies)
+        )
+        self._owns_session = True
+        return self._session
+    
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._owns_session and self._session is not None:
+            await self._session.close()
+
+
 async def initialize_grpc_channel_pool(api_url: str, pool_size: int) -> GrpcChannelPool:
     """
     Initialize a gRPC channel pool for the given target URL.
@@ -361,7 +531,7 @@ async def async_request_tgi(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         assert not request_func_input.use_beam_search
         assert request_func_input.logprobs is None
         params = {
@@ -434,7 +604,7 @@ async def async_request_trt_llm(
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         assert not request_func_input.use_beam_search
         assert request_func_input.best_of == 1
         assert request_func_input.logprobs is None
@@ -509,7 +679,7 @@ async def async_request_trt_llm(
 async def async_request_deepspeed_mii(
     idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
 ) -> RequestFuncOutput:
-    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         assert request_func_input.best_of == 1
         assert not request_func_input.use_beam_search
         assert request_func_input.logprobs is None
@@ -567,9 +737,7 @@ async def async_request_openai_completions(
     assert not request_func_input.use_beam_search
 
     if request_func_input.stream:
-        async with aiohttp.ClientSession(
-            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
-        ) as session:
+        async with _HttpSessionContext(request_func_input, request_func_input.cookies) as session:
             payload = {
                 "model": request_func_input.model,
                 "prompt": request_func_input.prompt,
@@ -656,9 +824,7 @@ async def async_request_openai_completions(
                 exc_info = sys.exc_info()
                 output.error += "".join(traceback.format_exception(*exc_info))
     else:
-        async with aiohttp.ClientSession(
-            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
-        ) as session:
+        async with _HttpSessionContext(request_func_input, request_func_input.cookies) as session:
             payload = {
                 "model": request_func_input.model,
                 "prompt": request_func_input.prompt,
@@ -724,10 +890,14 @@ async def async_request_openai_chat_completions(
         "v1/chat/completions"
     ), "OpenAI Chat Completions API URL must end with 'v1/chat/completions'."
 
-    content_body: List[dict[str, Any]] = [{"type": "text", "text": request_func_input.prompt}]
-
-    for media_item in request_func_input.media:
-        content_body.append({"type": "image_url", "image_url": {"url": media_item}})
+    # Use array format only when media is present, otherwise use string format
+    # (for compatibility with servers that don't support multimodal content format)
+    if request_func_input.media:
+        content_body: List[dict[str, Any]] = [{"type": "text", "text": request_func_input.prompt}]
+        for media_item in request_func_input.media:
+            content_body.append({"type": "image_url", "image_url": {"url": media_item}})
+    else:
+        content_body = request_func_input.prompt  # type: ignore
 
     telemetry_enabled = os.getenv("OTEL_ENABLED", "false").lower() == "true"
     otel_span = (
@@ -745,7 +915,7 @@ async def async_request_openai_chat_completions(
         else nullcontext()
     )
     with otel_span as span:
-        async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
+        async with _HttpSessionContext(request_func_input) as session:
             assert not request_func_input.use_beam_search
 
             # Apply custom prompt and schema formatting
@@ -1087,9 +1257,7 @@ async def async_request_cserve_debug(
     assert request_func_input.logprobs is None
 
     if request_func_input.stream:
-        async with aiohttp.ClientSession(
-            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
-        ) as session:
+        async with _HttpSessionContext(request_func_input, request_func_input.cookies) as session:
             payload = {
                 "prompt": request_func_input.prompt,
                 "sampling_params": {"n": 1, "max_tokens": request_func_input.output_len},
@@ -1156,9 +1324,7 @@ async def async_request_cserve_debug(
                 output.error = "".join(traceback.format_exception(*exc_info))
 
     else:
-        async with aiohttp.ClientSession(
-            **_build_http_session_kwargs(request_func_input, request_func_input.cookies)
-        ) as session:
+        async with _HttpSessionContext(request_func_input, request_func_input.cookies) as session:
             payload = {
                 "prompt": request_func_input.prompt,
                 "sampling_params": {
@@ -1247,7 +1413,7 @@ async def async_request_profiler(
         "stop_profile"
     ), "Torch Profiler API URL must end with 'start_profile' or 'stop_profile'."
 
-    async with aiohttp.ClientSession(**_build_http_session_kwargs(request_func_input)) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         payload = {
             "model": request_func_input.model,
             "messages": [],

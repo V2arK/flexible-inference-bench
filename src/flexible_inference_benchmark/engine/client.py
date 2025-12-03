@@ -11,6 +11,9 @@ from flexible_inference_benchmark.engine.backend_functions import (
     RequestFuncOutput,
     initialize_grpc_channel_pool,
     close_grpc_channel_pools,
+    initialize_http_session_pool,
+    close_http_session_pools,
+    _extract_base_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -182,8 +185,11 @@ class Client:
             pool_size = self.max_concurrent if self.max_concurrent else 1
             logger.info(f"Initializing gRPC channel pool with {pool_size} channels (matching max_concurrent)")
             await initialize_grpc_channel_pool(self.api_url, pool_size)
-        elif self.max_concurrent is not None:
-            logger.info(f"HTTP connection pool limit set to {self.max_concurrent} (matching max_concurrent)")
+        elif self.backend not in GRPC_BACKENDS and not self.force_new_http_connection:
+            pool_size = self.max_concurrent if self.max_concurrent else 100
+            base_url = _extract_base_url(self.api_url)
+            logger.info(f"Initializing HTTP session pool with limit={pool_size} for {base_url}")
+            await initialize_http_session_pool(base_url, pool_size, force_close=False)
 
         request_func_inputs = [
             RequestFuncInput(
@@ -236,9 +242,11 @@ class Client:
                     ]
                 )
         finally:
-            # Clean up gRPC channel pools after benchmark completes
+            # Clean up connection pools after benchmark completes
             if self.backend in GRPC_BACKENDS and not self.force_new_grpc_connection:
                 await close_grpc_channel_pools()
+            elif self.backend not in GRPC_BACKENDS and not self.force_new_http_connection:
+                await close_http_session_pools()
 
     async def validate_url_endpoint(
         self, request: Tuple[str, int, int], media_item: List[str]
