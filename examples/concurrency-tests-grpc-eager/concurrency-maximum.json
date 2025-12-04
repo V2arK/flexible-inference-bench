@@ -15,5 +15,5 @@
     "temperature": 0.0,
     "disable_stream": false,
     "num_validation_reqs": 5,
-    "output_file": "concurrency-maximum-results.json"
+    "output_file": "concurrency-maximum-eager-results.json"
 }

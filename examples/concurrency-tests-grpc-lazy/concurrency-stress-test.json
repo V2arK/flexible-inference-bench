@@ -5,15 +5,15 @@
     "seed": 123123,
     "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",
     "dataset_name": "sharegpt",
-    "num_of_req": 125,
-    "max_concurrent": 25,
-    "request_rate": 50,
+    "num_of_req": 500,
+    "max_concurrent": 100,
+    "request_rate": 200,
     "request_distribution": [
         "poisson",
-        50
+        200
     ],
     "temperature": 0.0,
     "disable_stream": false,
     "num_validation_reqs": 5,
-    "output_file": "concurrency-high-results.json"
+    "output_file": "concurrency-stress-lazy-results.json"
 }

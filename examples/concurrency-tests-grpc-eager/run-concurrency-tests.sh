@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# CentML gRPC Concurrency Test Suite
-# This script runs comprehensive concurrency tests for dummy-vllm's gRPC endpoint
+# CentML gRPC Concurrency Test Suite (EAGER MODE)
+# This script runs comprehensive concurrency tests with EAGER gRPC connection initialization
+# All connections are pre-established before the benchmark starts for lowest latency
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULTS_DIR="${SCRIPT_DIR}/concurrency-test-results"
+RESULTS_DIR="${SCRIPT_DIR}/concurrency-test-results-eager"
 
 mkdir -p "$RESULTS_DIR"
 cd "$RESULTS_DIR"
@@ -22,7 +23,8 @@ TARGET_OVERRIDE=${FIB_GRPC_TARGET:-}
 MODEL_OVERRIDE=${FIB_GRPC_MODEL:-}
 BACKEND_OVERRIDE=${FIB_GRPC_BACKEND:-}
 
-echo '=== CentML gRPC Concurrency Test Suite ==='
+echo '=== CentML gRPC Concurrency Test Suite (EAGER MODE) ==='
+echo 'Connection Mode: EAGER (pre-established connections for lowest latency)'
 echo "Env override target: ${TARGET_OVERRIDE:-'(from config files)'}"
 echo "Env override backend: ${BACKEND_OVERRIDE:-'(from config files)'}"
 echo "Env override model: ${MODEL_OVERRIDE:-'(from config files)'}"
@@ -367,9 +369,9 @@ run_test() {
     # Capture start time for baseline data collection
     local test_start_time=$(get_timestamp)
     
-    # Run benchmark
-    echo -e "${GREEN}???? Starting test...${NC}"
-    if fib benchmark --config-file "$prepared_config"; then
+    # Run benchmark with EAGER gRPC connection initialization
+    echo -e "${GREEN}???? Starting test (EAGER mode - pre-established connections)...${NC}"
+    if fib benchmark --config-file "$prepared_config" --eager-grpc-connection; then
         echo -e "${GREEN}�?? Test completed successfully${NC}"
     else
         echo -e "${RED}�?? Test failed or encountered errors${NC}"
