@@ -9,9 +9,16 @@ from flexible_inference_benchmark.engine.backend_functions import (
     ASYNC_REQUEST_FUNCS,
     RequestFuncInput,
     RequestFuncOutput,
+    initialize_grpc_channel_pool,
+    close_grpc_channel_pools,
+    initialize_http_session_pool,
+    close_http_session_pools,
+    _extract_base_url,
 )
 
 logger = logging.getLogger(__name__)
+
+GRPC_BACKENDS = {"openai-grpc", "vllm-grpc", "openai-chat-grpc"}
 
 
 class WaveState:
@@ -49,6 +56,9 @@ class Client:
         disable_thinking: bool = False,
         json_schema: Optional[Dict[str, Any]] = None,
         include_schema_in_prompt: bool = False,
+        force_new_grpc_connection: bool = False,
+        force_new_http_connection: bool = False,
+        lazy_grpc_connection: bool = True,
     ):
         self.backend = backend
         self.api_url = api_url
@@ -76,11 +86,17 @@ class Client:
         self.disable_thinking = disable_thinking
         self.json_schema = json_schema
         self.include_schema_in_prompt = include_schema_in_prompt
+        self.force_new_grpc_connection = force_new_grpc_connection
+        self.force_new_http_connection = force_new_http_connection
+        self.lazy_grpc_connection = lazy_grpc_connection
 
     @property
     def request_func(
         self,
-    ) -> Callable[[int, RequestFuncInput, Any, bool, float], Coroutine[Any, Any, RequestFuncOutput]]:
+    ) -> Callable[
+        [int, RequestFuncInput, Any, bool, float],
+        Coroutine[Any, Any, RequestFuncOutput],
+    ]:
         return ASYNC_REQUEST_FUNCS[self.backend]
 
     async def send_request(
@@ -109,9 +125,13 @@ class Client:
         await asyncio.sleep(wait_time)
         if sema:
             async with sema:
-                return await ASYNC_REQUEST_FUNCS['profiler'](idx, data, pbar, self.verbose, wait_time)
+                return await ASYNC_REQUEST_FUNCS["profiler"](
+                    idx, data, pbar, self.verbose, wait_time
+                )
         else:
-            return await ASYNC_REQUEST_FUNCS['profiler'](idx, data, pbar, self.verbose, wait_time)
+            return await ASYNC_REQUEST_FUNCS["profiler"](
+                idx, data, pbar, self.verbose, wait_time
+            )
 
     async def send_wave_request(
         self,
@@ -158,16 +178,49 @@ class Client:
                 sema.release()
                 if wave_state.num_finished_requests == self.wave_sustain:
                     # When wave is at min, num_running_requests will be at min-1 since a request just finished
-                    wave_state.delta = 1 if wave_state.num_running_requests == self.wave_min - 1 else -1
+                    wave_state.delta = (
+                        1
+                        if wave_state.num_running_requests == self.wave_min - 1
+                        else -1
+                    )
 
         return request_result
 
     async def benchmark(
-        self, data: List[Tuple[str, int, int]], request_times: List[Union[float, int]], requests_media: List[List[str]]
+        self,
+        data: List[Tuple[str, int, int]],
+        request_times: List[Union[float, int]],
+        requests_media: List[List[str]],
     ) -> list[Union[RequestFuncOutput, Any, None]]:
-        assert len(data) == len(request_times), "Data and request times must have the same length"
-        assert len(data) == len(requests_media), "Data and request media must have the same length"
+        assert len(data) == len(request_times), (
+            "Data and request times must have the same length"
+        )
+        assert len(data) == len(requests_media), (
+            "Data and request media must have the same length"
+        )
         pbar = None if self.disable_tqdm else tqdm(total=len(data))
+
+        # Initialize connection pools based on backend type
+        if self.backend in GRPC_BACKENDS and not self.force_new_grpc_connection:
+            pool_size = self.max_concurrent if self.max_concurrent else 1
+            mode_str = (
+                "lazy (connections on-demand)"
+                if self.lazy_grpc_connection
+                else "eager (pre-established)"
+            )
+            logger.info(
+                f"Initializing gRPC channel pool with {pool_size} channels ({mode_str})"
+            )
+            await initialize_grpc_channel_pool(
+                self.api_url, pool_size, lazy=self.lazy_grpc_connection
+            )
+        elif self.backend not in GRPC_BACKENDS and not self.force_new_http_connection:
+            pool_size = self.max_concurrent if self.max_concurrent else 100
+            base_url = _extract_base_url(self.api_url)
+            logger.info(
+                f"Initializing HTTP session pool with limit={pool_size} for {base_url}"
+            )
+            await initialize_http_session_pool(base_url, pool_size, force_close=False)
 
         request_func_inputs = [
             RequestFuncInput(
@@ -193,28 +246,50 @@ class Client:
                 disable_thinking=self.disable_thinking,
                 json_schema=self.json_schema,
                 include_schema_in_prompt=self.include_schema_in_prompt,
+                force_new_grpc_connection=self.force_new_grpc_connection,
+                force_new_http_connection=self.force_new_http_connection,
+                http_connection_pool_limit=self.max_concurrent,
             )
             for (data_sample, media_sample) in zip(data, requests_media)
         ]
 
-        if self.wave:
-            sema = asyncio.Semaphore(self.wave_max)
-            wave_state = WaveState()
-            return await asyncio.gather(
-                *[
-                    self.send_wave_request(idx, data, request_time, pbar, sema, wave_state)
-                    for idx, (data, request_time) in enumerate(zip(request_func_inputs, request_times))
-                ]
-            )
+        try:
+            if self.wave:
+                sema = asyncio.Semaphore(self.wave_max)
+                wave_state = WaveState()
+                return await asyncio.gather(
+                    *[
+                        self.send_wave_request(
+                            idx, data, request_time, pbar, sema, wave_state
+                        )
+                        for idx, (data, request_time) in enumerate(
+                            zip(request_func_inputs, request_times)
+                        )
+                    ]
+                )
 
-        else:
-            b_sema = asyncio.BoundedSemaphore(self.max_concurrent) if self.max_concurrent else None
-            return await asyncio.gather(
-                *[
-                    self.send_request(idx, data, request_time, pbar, b_sema)
-                    for idx, (data, request_time) in enumerate(zip(request_func_inputs, request_times))
-                ]
-            )
+            else:
+                b_sema = (
+                    asyncio.BoundedSemaphore(self.max_concurrent)
+                    if self.max_concurrent
+                    else None
+                )
+                return await asyncio.gather(
+                    *[
+                        self.send_request(idx, data, request_time, pbar, b_sema)
+                        for idx, (data, request_time) in enumerate(
+                            zip(request_func_inputs, request_times)
+                        )
+                    ]
+                )
+        finally:
+            # Clean up connection pools after benchmark completes
+            if self.backend in GRPC_BACKENDS and not self.force_new_grpc_connection:
+                await close_grpc_channel_pools()
+            elif (
+                self.backend not in GRPC_BACKENDS and not self.force_new_http_connection
+            ):
+                await close_http_session_pools()
 
     async def validate_url_endpoint(
         self, request: Tuple[str, int, int], media_item: List[str]
@@ -242,6 +317,9 @@ class Client:
             disable_thinking=self.disable_thinking,
             json_schema=self.json_schema,
             include_schema_in_prompt=self.include_schema_in_prompt,
+            force_new_grpc_connection=self.force_new_grpc_connection,
+            force_new_http_connection=self.force_new_http_connection,
+            http_connection_pool_limit=self.max_concurrent,
         )
         return await self.send_request(-1, data, 0, None, None)
 
@@ -269,6 +347,9 @@ class Client:
             disable_thinking=self.disable_thinking,
             json_schema=self.json_schema,
             include_schema_in_prompt=self.include_schema_in_prompt,
+            force_new_grpc_connection=self.force_new_grpc_connection,
+            force_new_http_connection=self.force_new_http_connection,
+            http_connection_pool_limit=self.max_concurrent,
         )
         return await self.signal_profiler(0, data, 0, None, None)
 
@@ -296,5 +377,8 @@ class Client:
             disable_thinking=self.disable_thinking,
             json_schema=self.json_schema,
             include_schema_in_prompt=self.include_schema_in_prompt,
+            force_new_grpc_connection=self.force_new_grpc_connection,
+            force_new_http_connection=self.force_new_http_connection,
+            http_connection_pool_limit=self.max_concurrent,
         )
         return await self.signal_profiler(0, data, 0, None, None)

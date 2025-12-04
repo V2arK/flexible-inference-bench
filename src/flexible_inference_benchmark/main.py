@@ -18,7 +18,12 @@ from tqdm import tqdm
 import numpy as np
 from PIL import Image
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase  # type: ignore[attr-defined]
-from flexible_inference_benchmark.engine.distributions import DISTRIBUTION_CLASSES, Distribution, Same, UniformInt
+from flexible_inference_benchmark.engine.distributions import (
+    DISTRIBUTION_CLASSES,
+    Distribution,
+    Same,
+    UniformInt,
+)
 from flexible_inference_benchmark.utils.utils import (
     configure_logging,
     try_find_model,
@@ -32,7 +37,10 @@ from flexible_inference_benchmark.engine.data import ShareGPT, Textfile, Random
 from flexible_inference_benchmark.engine.client import Client
 from flexible_inference_benchmark.engine.backend_functions import ASYNC_REQUEST_FUNCS
 from flexible_inference_benchmark.engine.workloads import WORKLOADS_TYPES
-from flexible_inference_benchmark.data_postprocessors.performance import add_performance_parser, calculate_metrics
+from flexible_inference_benchmark.data_postprocessors.performance import (
+    add_performance_parser,
+    calculate_metrics,
+)
 from flexible_inference_benchmark.data_postprocessors.ttft import add_ttft_parser
 from flexible_inference_benchmark.data_postprocessors.itl import add_itl_parser
 from flexible_inference_benchmark.utils.telemetry import setup_telemetry
@@ -45,15 +53,18 @@ logger = logging.getLogger(__name__)
 DEFAULT_NUM_TRIALS = 10
 MAX_TRIALS = 100  # Maximum trials for prompt generation, warn if exceeded
 
+GRPC_BACKENDS = {"openai-grpc", "vllm-grpc", "openai-chat-grpc"}
 
-def return_random_image_by_size(width: int, height: int, convert_to_base64: bool = False) -> Any:
 
+def return_random_image_by_size(
+    width: int, height: int, convert_to_base64: bool = False
+) -> Any:
     image_url = f"https://picsum.photos/{width}/{height}"
     if convert_to_base64:
         image_size = (width, height)
         channels = 3
         random_bytes = os.urandom(width * height * channels)
-        random_image = Image.frombytes('RGB', image_size, random_bytes)
+        random_image = Image.frombytes("RGB", image_size, random_bytes)
         buffered = io.BytesIO()
         random_image.save(buffered, format="JPEG")
         base64_encoded_image = base64.b64encode(buffered.getvalue())
@@ -70,7 +81,11 @@ def parse_tuple(value: str) -> List[Tuple[int, int]]:
         "1280x720,256x256" -> [(1280, 720),(256, 256)]
     """
     try:
-        return [(int(width), int(height)) for part in value.split(',') for width, height in [part.split('x')]]
+        return [
+            (int(width), int(height))
+            for part in value.split(",")
+            for width, height in [part.split("x")]
+        ]
     except ValueError as e:
         raise argparse.ArgumentTypeError(
             (
@@ -88,7 +103,6 @@ def generate_request_media(
     size: int,
     send_image_with_base64: bool = False,
 ) -> List[List[List[str]]]:
-
     num_imgs_per_req = num_of_imgs_per_req
     if not num_imgs_per_req:
         return [[[] for _ in range(size)]]
@@ -105,20 +119,26 @@ def generate_request_media(
             # If img_base_path is provided, store the image locally
             # Otherwise, feed the image online
             if img_base_path:
-                assert not send_image_with_base64, "Base64 encoding is not supported for local images"
+                assert not send_image_with_base64, (
+                    "Base64 encoding is not supported for local images"
+                )
                 # If an image doesn't exist, download it
-                img_path = os.path.join(img_base_path, f"{ratios[0]}x{ratios[1]}_{img_cntr + 1}.jpg")
+                img_path = os.path.join(
+                    img_base_path, f"{ratios[0]}x{ratios[1]}_{img_cntr + 1}.jpg"
+                )
                 if not os.path.exists(img_path):
                     os.makedirs(img_base_path, exist_ok=True)
                     logger.info(f"Downloading image to {img_path} ...")
                     img_url = return_random_image_by_size(ratios[0], ratios[1])
                     img_data = requests.get(img_url, timeout=60).content
-                    with open(img_path, 'wb') as handler:
+                    with open(img_path, "wb") as handler:
                         handler.write(img_data)
-                media_file = 'file://' + img_path
+                media_file = "file://" + img_path
             else:
                 # Fetch the image online with the ratios
-                media_file = return_random_image_by_size(ratios[0], ratios[1], convert_to_base64=send_image_with_base64)
+                media_file = return_random_image_by_size(
+                    ratios[0], ratios[1], convert_to_base64=send_image_with_base64
+                )
 
             img_cntr += 1
             if send_image_with_base64:
@@ -129,7 +149,11 @@ def generate_request_media(
 
         with ThreadPoolExecutor(max_workers=32) as executor:
             futures = [executor.submit(_process_sample) for _ in range(size)]
-            for future in tqdm(futures, desc=f"Generating images for {ratios[0]}x{ratios[1]}", total=size):
+            for future in tqdm(
+                futures,
+                desc=f"Generating images for {ratios[0]}x{ratios[1]}",
+                total=size,
+            ):
                 future.result()
 
         results.append(media_per_request)
@@ -152,7 +176,9 @@ def generate_request_times(args: argparse.Namespace) -> List[Union[int, float]]:
         size = 1
         dist = select_distribution(args.request_distribution)
         # Check if any elements exceed max length
-        while size < 1e6 and not [i for i in dist.generate_distribution(size) if i > args.max_time_for_reqs]:
+        while size < 1e6 and not [
+            i for i in dist.generate_distribution(size) if i > args.max_time_for_reqs
+        ]:
             size *= 2
         requests_times = dist.generate_distribution(size)
         if size >= 1e6:
@@ -168,8 +194,16 @@ def generate_prompts(
     filename = args.dataset_path
     prompt_cls: Union[Random, Textfile, ShareGPT, None] = None
 
-    input_prompt_dist = select_distribution(args.input_token_distribution) if args.input_token_distribution else None
-    output_token_dist = select_distribution(args.output_token_distribution) if args.output_token_distribution else None
+    input_prompt_dist = (
+        select_distribution(args.input_token_distribution)
+        if args.input_token_distribution
+        else None
+    )
+    output_token_dist = (
+        select_distribution(args.output_token_distribution)
+        if args.output_token_distribution
+        else None
+    )
     if args.native_output_len:
         if output_token_dist is not None:
             raise ValueError(
@@ -185,7 +219,7 @@ def generate_prompts(
 
         output_token_dist = Same(8192)
 
-    if args.dataset_name.startswith('sharegpt'):
+    if args.dataset_name.startswith("sharegpt"):
         if args.input_token_distribution is not None:
             raise ValueError(
                 "Input token distribution is not supported with ShareGPT dataset. "
@@ -195,11 +229,17 @@ def generate_prompts(
             "User selected sharegpt dataset. "
             "Ignoring prompt length distribution and following the prompts from the dataset."
         )
-        if args.num_trials != DEFAULT_NUM_TRIALS:  # Check if user specified custom value
-            logger.warning("num_trials parameter is ignored for ShareGPT dataset as prompts are pre-defined")
+        if (
+            args.num_trials != DEFAULT_NUM_TRIALS
+        ):  # Check if user specified custom value
+            logger.warning(
+                "num_trials parameter is ignored for ShareGPT dataset as prompts are pre-defined"
+            )
         prompt_cls = ShareGPT(filename, tokenizer, output_token_dist)
     else:
-        logger.info(f"User selected {args.dataset_name} dataset. Generating prompt from distributions.")
+        logger.info(
+            f"User selected {args.dataset_name} dataset. Generating prompt from distributions."
+        )
         if input_prompt_dist is None:
             logger.info(
                 "Input token distribution not provided. Defaulting to uniform distribution from 1 to 255 tokens."
@@ -277,22 +317,27 @@ def send_requests(
     requests_times: List[Union[int, float]],
     requests_media: List[List[str]],
 ) -> List[Any]:
-    return asyncio.run(client.benchmark(requests_prompts, requests_times, requests_media))
+    return asyncio.run(
+        client.benchmark(requests_prompts, requests_times, requests_media)
+    )
 
 
 def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # type: ignore [type-arg]
-
     benchmark_parser = subparsers.add_parser(
-        'benchmark', help="Benchmark an LLM serving endpoint", usage="fib benchmark [options]"
+        "benchmark",
+        help="Benchmark an LLM serving endpoint",
+        usage="fib benchmark [options]",
     )
 
-    benchmark_parser.add_argument("--seed", type=int, default=None, help="seed for reproducibility")
+    benchmark_parser.add_argument(
+        "--seed", type=int, default=None, help="seed for reproducibility"
+    )
 
     benchmark_parser.add_argument(
         "-b",
         "--backend",
         type=str,
-        default='openai',
+        default="openai",
         choices=list(ASYNC_REQUEST_FUNCS.keys()),
         help="Backend inference engine.",
     )
@@ -309,20 +354,30 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
 
     url_group = benchmark_parser.add_mutually_exclusive_group()
 
-    url_group.add_argument("--base-url", type=str, default=None, help="Server base URL.")
+    url_group.add_argument(
+        "--base-url", type=str, default=None, help="Server base URL."
+    )
 
     benchmark_parser.add_argument(
-        "--https-ssl", default=True, help="Whether to check SSL certificates for HTTPS endpoints, default is True"
+        "--https-ssl",
+        default=True,
+        help="Whether to check SSL certificates for HTTPS endpoints, default is True",
     )
 
     benchmark_parser.add_argument("--endpoint", type=str, help="API endpoint.")
 
     req_group = benchmark_parser.add_mutually_exclusive_group()
 
-    req_group.add_argument("-n", "--num-of-req", type=int, default=None, help="Total number of request.")
+    req_group.add_argument(
+        "-n", "--num-of-req", type=int, default=None, help="Total number of request."
+    )
 
     req_group.add_argument(
-        "--max-time-for-reqs", "--timeout", type=int, default=None, help="Max time for requests in seconds."
+        "--max-time-for-reqs",
+        "--timeout",
+        type=int,
+        default=None,
+        help="Max time for requests in seconds.",
     )
 
     benchmark_parser.add_argument(
@@ -335,7 +390,7 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
     benchmark_parser.add_argument(
         "--img-ratios-per-req",
         type=parse_tuple,
-        default='500x500',
+        default="500x500",
         help=(
             "Single string with image aspect ratios (width x height) separated by commas "
             "to attach per request. Example: '256x256,500x500'."
@@ -390,7 +445,7 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
     benchmark_parser.add_argument(
         "-rps",
         "--requests-per-second",
-        dest='request_distribution',
+        dest="request_distribution",
         type=lambda n: ["poisson", n],
         help="Presets the request distribution to N requests per second following a poisson distribution.",
     )
@@ -433,15 +488,35 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
 
     prefix_group = benchmark_parser.add_mutually_exclusive_group()
 
-    prefix_group.add_argument("--prefix-text", type=str, default=None, help="Text to use as prefix for all requests.")
+    prefix_group.add_argument(
+        "--prefix-text",
+        type=str,
+        default=None,
+        help="Text to use as prefix for all requests.",
+    )
 
-    prefix_group.add_argument("--prefix-len", type=int, default=None, help="Length of prefix to use for all requests.")
+    prefix_group.add_argument(
+        "--prefix-len",
+        type=int,
+        default=None,
+        help="Length of prefix to use for all requests.",
+    )
 
-    benchmark_parser.add_argument("--disable-ignore-eos", action="store_true", help="Disables ignoring the eos token.")
+    benchmark_parser.add_argument(
+        "--disable-ignore-eos",
+        action="store_true",
+        help="Disables ignoring the eos token.",
+    )
 
-    benchmark_parser.add_argument("--disable-stream", action="store_true", help="Disable stream response from API.")
+    benchmark_parser.add_argument(
+        "--disable-stream",
+        action="store_true",
+        help="Disable stream response from API.",
+    )
 
-    benchmark_parser.add_argument("--cookies", default={}, help="Insert cookies in the request.")
+    benchmark_parser.add_argument(
+        "--cookies", default={}, help="Insert cookies in the request."
+    )
 
     benchmark_parser.add_argument(
         "--dataset-name",
@@ -452,26 +527,46 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
         help="Name of the dataset to benchmark on.",
     )
 
-    benchmark_parser.add_argument("--dataset-path", type=str, default=None, help="Path to the dataset.")
+    benchmark_parser.add_argument(
+        "--dataset-path", type=str, default=None, help="Path to the dataset."
+    )
 
     benchmark_parser.add_argument("-m", "--model", type=str, help="Name of the model.")
 
     benchmark_parser.add_argument(
-        "--tokenizer", type=str, default=None, help="Name or path of the tokenizer, if not using the default tokenizer."
+        "--tokenizer",
+        type=str,
+        default=None,
+        help="Name or path of the tokenizer, if not using the default tokenizer.",
     )
 
     benchmark_parser.add_argument(
-        "--tokenizer-mode", type=str, default=None, help="Specify tokenizer mode. Eg. mistral. Default None"
+        "--tokenizer-mode",
+        type=str,
+        default=None,
+        help="Specify tokenizer mode. Eg. mistral. Default None",
     )
 
-    benchmark_parser.add_argument("--disable-tqdm", action="store_true", help="Specify to disable tqdm progress bar.")
-
-    benchmark_parser.add_argument("--best-of", type=int, default=1, help="Number of best completions to return.")
-
-    benchmark_parser.add_argument("--use-beam-search", action="store_true", help="Use beam search for completions.")
+    benchmark_parser.add_argument(
+        "--disable-tqdm",
+        action="store_true",
+        help="Specify to disable tqdm progress bar.",
+    )
 
     benchmark_parser.add_argument(
-        "--json-response", action="store_true", help="Request responses in JSON format from the API."
+        "--best-of", type=int, default=1, help="Number of best completions to return."
+    )
+
+    benchmark_parser.add_argument(
+        "--use-beam-search",
+        action="store_true",
+        help="Use beam search for completions.",
+    )
+
+    benchmark_parser.add_argument(
+        "--json-response",
+        action="store_true",
+        help="Request responses in JSON format from the API.",
     )
 
     benchmark_parser.add_argument(
@@ -498,34 +593,55 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
     )
 
     benchmark_parser.add_argument(
-        "--disable-thinking", action="store_true", help="Disable thinking mode in chat templates."
+        "--disable-thinking",
+        action="store_true",
+        help="Disable thinking mode in chat templates.",
     )
 
     benchmark_parser.add_argument(
         "--output-file",
         type=str,
-        default='output-file.json',
+        default="output-file.json",
         required=False,
         help="Output json file to save the results.",
     )
 
-    benchmark_parser.add_argument("--debug", action="store_true", help="Log debug messages.")
+    benchmark_parser.add_argument(
+        "--debug", action="store_true", help="Log debug messages."
+    )
 
     benchmark_parser.add_argument(
         "--profile",
         action="store_true",
-        help="Use Torch Profiler. The endpoint must be launched with " "VLLM_TORCH_PROFILER_DIR to enable profiler.",
+        help="Use Torch Profiler. The endpoint must be launched with "
+        "VLLM_TORCH_PROFILER_DIR to enable profiler.",
     )
 
-    benchmark_parser.add_argument("--verbose", action="store_true", help="Print short description of each request.")
+    benchmark_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print short description of each request.",
+    )
 
-    benchmark_parser.add_argument("--temperature", "--temp", type=float, default=0.0, help="Temperature for sampling.")
+    benchmark_parser.add_argument(
+        "--temperature",
+        "--temp",
+        type=float,
+        default=0.0,
+        help="Temperature for sampling.",
+    )
 
-    benchmark_parser.add_argument("--top-p", type=float, default=None, help="Top-p for sampling.")
+    benchmark_parser.add_argument(
+        "--top-p", type=float, default=None, help="Top-p for sampling."
+    )
 
-    benchmark_parser.add_argument("--top-k", type=int, default=None, help="Top-k for sampling.")
+    benchmark_parser.add_argument(
+        "--top-k", type=int, default=None, help="Top-k for sampling."
+    )
 
-    benchmark_parser.add_argument("-c", "--config-file", default=None, help="Configuration file.")
+    benchmark_parser.add_argument(
+        "-c", "--config-file", default=None, help="Configuration file."
+    )
 
     benchmark_parser.add_argument(
         "--validation-prompt-tokens",
@@ -543,12 +659,31 @@ def add_benchmark_subparser(subparsers: argparse._SubParsersAction) -> Any:  # t
         "but may slow down prompt generation. Ignored for ShareGPT datasets.",
     )
 
+    benchmark_parser.add_argument(
+        "--force-new-grpc-connection",
+        action="store_true",
+        help="Force creating a new gRPC connection for every request instead of reusing channels.",
+    )
+
+    benchmark_parser.add_argument(
+        "--force-new-http-connection",
+        action="store_true",
+        help="Force HTTP requests to close sockets after every response (disable keep-alive).",
+    )
+
+    benchmark_parser.add_argument(
+        "--eager-grpc-connection",
+        action="store_true",
+        help="Use eager gRPC connection initialization (pre-establish all connections before benchmark) "
+        "instead of lazy on-demand connections. Provides lowest latency but not comparable to HTTP.",
+    )
+
     return benchmark_parser
 
 
 def validate_json_args(args: argparse.Namespace) -> None:
     """Validate JSON-related arguments and load files."""
-    if args.subcommand != 'benchmark':
+    if args.subcommand != "benchmark":
         return
 
     # Process JSON prompt with @file support
@@ -558,7 +693,7 @@ def validate_json_args(args: argparse.Namespace) -> None:
             # File-based prompt loading
             prompt_file_path = args.json_prompt[1:]  # Remove @ prefix
             try:
-                with open(prompt_file_path, 'r', encoding='utf-8') as f:
+                with open(prompt_file_path, "r", encoding="utf-8") as f:
                     custom_prompt = f.read().strip()
                 if not custom_prompt:
                     logger.error(f"Prompt file '{prompt_file_path}' is empty")
@@ -582,13 +717,13 @@ def validate_json_args(args: argparse.Namespace) -> None:
 
     # Process JSON schema if provided
     json_schema = None
-    original_json_schema = getattr(args, 'json_schema', None)
+    original_json_schema = getattr(args, "json_schema", None)
     if args.json_schema:
         if args.json_schema.startswith("@"):
             # File-based schema loading
             schema_file_path = args.json_schema[1:]  # Remove @ prefix
             try:
-                with open(schema_file_path, 'r') as f:
+                with open(schema_file_path, "r") as f:
                     json_schema = json.load(f)
                 # Basic validation that it's a valid JSON schema structure
                 if not isinstance(json_schema, dict):
@@ -599,7 +734,9 @@ def validate_json_args(args: argparse.Namespace) -> None:
                 logger.error(f"JSON schema file '{schema_file_path}' does not exist")
                 sys.exit(1)
             except (OSError, PermissionError) as e:
-                logger.error(f"Failed to load JSON schema file '{schema_file_path}': {e}")
+                logger.error(
+                    f"Failed to load JSON schema file '{schema_file_path}': {e}"
+                )
                 sys.exit(1)
             except json.JSONDecodeError as e:
                 logger.error(f"Invalid JSON in schema file '{schema_file_path}': {e}")
@@ -631,7 +768,9 @@ def validate_json_args(args: argparse.Namespace) -> None:
     if args.include_schema_in_prompt:
         if not json_schema:
             logger.error("--include-schema-in-prompt requires a JSON schema")
-            logger.error("Suggestion: Add --json-schema <schema> or --json-schema @file")
+            logger.error(
+                "Suggestion: Add --json-schema <schema> or --json-schema @file"
+            )
             sys.exit(3)
 
     # 3. File size warnings (optional)
@@ -640,7 +779,9 @@ def validate_json_args(args: argparse.Namespace) -> None:
         try:
             file_size = os.path.getsize(schema_file_path)
             if file_size > 1024 * 1024:  # 1MB
-                logger.warning(f"Large schema file ({file_size / (1024*1024):.1f}MB) may impact performance")
+                logger.warning(
+                    f"Large schema file ({file_size / (1024 * 1024):.1f}MB) may impact performance"
+                )
         except OSError:
             pass  # File size check is optional
 
@@ -649,16 +790,19 @@ def validate_json_args(args: argparse.Namespace) -> None:
         try:
             file_size = os.path.getsize(prompt_file_path)
             if file_size > 100 * 1024:  # 100KB
-                logger.warning(f"Large prompt file ({file_size / 1024:.1f}KB) may impact performance")
+                logger.warning(
+                    f"Large prompt file ({file_size / 1024:.1f}KB) may impact performance"
+                )
         except OSError:
             pass  # File size check is optional
 
 
 def parse_args() -> argparse.Namespace:
-
     parser = argparse.ArgumentParser(description="CentML Inference Benchmark")
 
-    subparsers = parser.add_subparsers(title='Subcommands', dest='subcommand', required=True)
+    subparsers = parser.add_subparsers(
+        title="Subcommands", dest="subcommand", required=True
+    )
 
     add_performance_parser(subparsers)
     benchmark_parser = add_benchmark_subparser(subparsers)
@@ -666,9 +810,9 @@ def parse_args() -> argparse.Namespace:
     add_itl_parser(subparsers)
 
     args = parser.parse_args()
-    if args.subcommand == 'benchmark':
+    if args.subcommand == "benchmark":
         if args.config_file:
-            with open(args.config_file, 'r') as f:
+            with open(args.config_file, "r") as f:
                 file_data = json.load(f)
             for k, v in file_data.items():
                 # Reload arguments to override config file values with command line values
@@ -678,7 +822,7 @@ def parse_args() -> argparse.Namespace:
 
         def fail(msg: str) -> None:
             benchmark_parser.print_help()
-            print('\n\n\n')
+            print("\n\n\n")
             logger.error(msg)
             sys.exit(1)
 
@@ -692,7 +836,9 @@ def parse_args() -> argparse.Namespace:
             if args.wave[2] <= 0:
                 fail("Wave sustain must be positive")
             if args.max_concurrent:
-                logger.warning("Both varying requests and max concurrency provided. Ignoring max concurrency")
+                logger.warning(
+                    "Both varying requests and max concurrency provided. Ignoring max concurrency"
+                )
                 args.max_concurrent = None
             if args.request_distribution:
                 logger.warning(
@@ -703,43 +849,62 @@ def parse_args() -> argparse.Namespace:
             args.request_distribution = ["poisson", "inf"]
 
         if not (args.num_of_req or args.max_time_for_reqs):
-            logger.info("Number of requests and max time for requests not provided. Defaulting to 1 request.")
+            logger.info(
+                "Number of requests and max time for requests not provided. Defaulting to 1 request."
+            )
             args.num_of_req = 1
 
         openapi = None
-        if not args.base_url or not args.model or not args.endpoint:
+        if args.backend in GRPC_BACKENDS:
             if not args.base_url:
-                logger.info("Base url not provided. Searching for ports on localhost...")
-                base_try_options = ["http://localhost:8000", "http://localhost:8080"]
-            else:
-                base_try_options = [args.base_url]
-            for base_url, path in itertools.product(base_try_options, ["openapi.json", "health", "openai/health"]):
-                try:
-                    response = requests.get(f"{base_url}/{path}", timeout=1)
-                    response.raise_for_status()
-                    args.base_url = base_url
-                    if "openapi" in path:
-                        openapi = response.json()
-                    break
-                except (requests.HTTPError, requests.ConnectionError):
-                    continue
-            if not args.base_url:
-                fail("No server found. Please provide the base url.")
-            logger.info(f"Server found at {args.base_url}. Continuing.")
-        if not args.model:
-            logger.info("Model name not provided. Trying to query the model name from the server.")
-            model = try_find_model(args.base_url, openapi)
-            if model is None:
-                fail("Model could not be deduced automatically. Please provide the model name.")
-            else:
-                logger.info(f"Model identified: {model}")
-                args.model = model
-        if not args.endpoint:
-            args.endpoint = try_find_endpoint(args.base_url, openapi)
-        if args.endpoint and args.endpoint[0] != '/':
+                fail("Base url must be provided for gRPC backends.")
+            if not args.model:
+                fail("Model name must be provided for gRPC backends.")
+        else:
+            if not args.base_url or not args.model or not args.endpoint:
+                if not args.base_url:
+                    logger.info(
+                        "Base url not provided. Searching for ports on localhost..."
+                    )
+                    base_try_options = [
+                        "http://localhost:8000",
+                        "http://localhost:8080",
+                    ]
+                else:
+                    base_try_options = [args.base_url]
+                for base_url, path in itertools.product(
+                    base_try_options, ["openapi.json", "health", "openai/health"]
+                ):
+                    try:
+                        response = requests.get(f"{base_url}/{path}", timeout=1)
+                        response.raise_for_status()
+                        args.base_url = base_url
+                        if "openapi" in path:
+                            openapi = response.json()
+                        break
+                    except (requests.HTTPError, requests.ConnectionError):
+                        continue
+                if not args.base_url:
+                    fail("No server found. Please provide the base url.")
+                logger.info(f"Server found at {args.base_url}. Continuing.")
+            if not args.model:
+                logger.info(
+                    "Model name not provided. Trying to query the model name from the server."
+                )
+                model = try_find_model(args.base_url, openapi)
+                if model is None:
+                    fail(
+                        "Model could not be deduced automatically. Please provide the model name."
+                    )
+                else:
+                    logger.info(f"Model identified: {model}")
+                    args.model = model
+            if not args.endpoint:
+                args.endpoint = try_find_endpoint(args.base_url, openapi)
+        if args.endpoint and args.endpoint[0] != "/":
             args.endpoint = "/" + args.endpoint
 
-        if not args.dataset_path and args.dataset_name.startswith('sharegpt'):
+        if not args.dataset_path and args.dataset_name.startswith("sharegpt"):
             # download the sharegpt dataset and cache it in the home directory
             cache_dir = os.path.expanduser("~/.cache/flexible_inference_benchmark/")
             dataset_filename = args.dataset_name + ".json"
@@ -748,12 +913,13 @@ def parse_args() -> argparse.Namespace:
             sharegpt_path = os.path.join(cache_dir, dataset_filename)
             if not os.path.exists(sharegpt_path):
                 logger.info(
-                    "Downloading the sharegpt dataset to ~/.cache/flexible_inference_benchmark/%s ...", dataset_filename
+                    "Downloading the sharegpt dataset to ~/.cache/flexible_inference_benchmark/%s ...",
+                    dataset_filename,
                 )
                 download_sharegpt_dataset(args.dataset_name, sharegpt_path)
             args.dataset_path = sharegpt_path
 
-        if args.dataset_name.startswith('sharegpt') and args.workload_type:
+        if args.dataset_name.startswith("sharegpt") and args.workload_type:
             fail(
                 "ShareGPT dataset is selected. "
                 "Prompt and output distributions will be ignored. "
@@ -767,7 +933,9 @@ def parse_args() -> argparse.Namespace:
         if args.num_trials <= 0:
             fail("Number of trials must be positive")
         if args.num_trials > MAX_TRIALS:
-            logger.warning(f"High num_trials value ({args.num_trials}) may slow down prompt generation")
+            logger.warning(
+                f"High num_trials value ({args.num_trials}) may slow down prompt generation"
+            )
 
     # Validate JSON-related arguments
     validate_json_args(args)
@@ -829,7 +997,11 @@ def run_main(args: argparse.Namespace) -> None:
                 "fib.command": json.dumps(
                     {
                         "subcommand": args.subcommand,
-                        "args": {k: v for k, v in vars(args).items() if k not in ['subcommand'] and v is not None},
+                        "args": {
+                            k: v
+                            for k, v in vars(args).items()
+                            if k not in ["subcommand"] and v is not None
+                        },
                     }
                 ),
             },
@@ -842,10 +1014,16 @@ def run_main(args: argparse.Namespace) -> None:
         requests_times = generate_request_times(args)
         size = len(requests_times)
         requests_media = generate_request_media(
-            args.num_of_imgs_per_req, args.img_ratios_per_req, args.img_base_path, size, args.send_image_with_base64
+            args.num_of_imgs_per_req,
+            args.img_ratios_per_req,
+            args.img_base_path,
+            size,
+            args.send_image_with_base64,
         )
         tokenizer_id = args.tokenizer if args.tokenizer else args.model
-        tokenizer: PreTrainedTokenizerBase = select_tokenizer(tokenizer_id, args.tokenizer_mode)
+        tokenizer: PreTrainedTokenizerBase = select_tokenizer(
+            tokenizer_id, args.tokenizer_mode
+        )
         requests_prompts = generate_prompts(args, tokenizer, size)
         min_length = min(len(requests_prompts), len(requests_times))
         requests_prompts = requests_prompts[:min_length]
@@ -854,13 +1032,16 @@ def run_main(args: argparse.Namespace) -> None:
 
         set_max_open_files(min_length + 256)
 
-        base_url = args.base_url.strip("/")
-        endpoint = args.endpoint.strip("/")
-        args.api_url = f"{base_url}/{endpoint}"
+        base_url = args.base_url.strip("/") if args.base_url else ""
+        endpoint = args.endpoint.strip("/") if args.endpoint else ""
+        if args.backend in GRPC_BACKENDS:
+            args.api_url = base_url
+        else:
+            args.api_url = f"{base_url}/{endpoint}" if endpoint else base_url
 
         # JSON processing and validation handled in parse_args()
         custom_prompt = args.json_prompt
-        json_schema = getattr(args, 'json_schema', None)
+        json_schema = getattr(args, "json_schema", None)
 
         client = Client(
             args.backend,
@@ -886,14 +1067,19 @@ def run_main(args: argparse.Namespace) -> None:
             custom_prompt=custom_prompt,
             disable_thinking=args.disable_thinking,
             json_schema=json_schema,
-            include_schema_in_prompt=getattr(args, 'include_schema_in_prompt', False),
+            include_schema_in_prompt=getattr(args, "include_schema_in_prompt", False),
+            force_new_grpc_connection=getattr(args, "force_new_grpc_connection", False),
+            force_new_http_connection=getattr(args, "force_new_http_connection", False),
+            lazy_grpc_connection=not getattr(args, "eager_grpc_connection", False),
         )
         # disable verbose output for validation of the endpoint. This is done to avoid confusion on terminal output.
         client_verbose_value = client.verbose
         client.verbose = False
 
         # Generate fixed-size validation prompt instead of using first request
-        validation_prompt_data = generate_fixed_validation_prompt(tokenizer, args.validation_prompt_tokens)
+        validation_prompt_data = generate_fixed_validation_prompt(
+            tokenizer, args.validation_prompt_tokens
+        )
         validation_media = requests_media[0][0] if requests_media[0] else []
 
         logger.info(
@@ -903,7 +1089,9 @@ def run_main(args: argparse.Namespace) -> None:
             )
         )
         for _ in range(args.num_validation_reqs):
-            validate_endpoint = asyncio.run(client.validate_url_endpoint(validation_prompt_data, validation_media))
+            validate_endpoint = asyncio.run(
+                client.validate_url_endpoint(validation_prompt_data, validation_media)
+            )
             if not validate_endpoint.success:
                 logger.info(f"{validate_endpoint.error}.\nExiting benchmark ....")
                 sys.exit(1)
@@ -924,18 +1112,27 @@ def run_main(args: argparse.Namespace) -> None:
                     )
                 )
             t = time.perf_counter()
-            output_list: List[Any] = send_requests(client, requests_prompts, requests_times, arr_dims)
+            output_list: List[Any] = send_requests(
+                client, requests_prompts, requests_times, arr_dims
+            )
             benchmark_time = time.perf_counter() - t
             # pylint: disable=line-too-long
 
             text_summaries: list[str] = []
             if any(hasattr(o, "generated_text") for o in output_list):
-                text_summaries = [o.generated_text for o in output_list if hasattr(o, "generated_text")]  # type: ignore
+                text_summaries = [
+                    o.generated_text
+                    for o in output_list
+                    if hasattr(o, "generated_text")
+                ]  # type: ignore
             output = {
                 "backend": args.backend,
                 "time": benchmark_time,
                 "summary": text_summaries,
-                "outputs": [request_func_output.model_dump() for request_func_output in output_list],  # type: ignore
+                "outputs": [
+                    request_func_output.model_dump()
+                    for request_func_output in output_list
+                ],  # type: ignore
                 "inputs": requests_prompts,
                 "tokenizer": args.tokenizer if args.tokenizer else args.model,
                 "stream": not args.disable_stream,
@@ -943,7 +1140,11 @@ def run_main(args: argparse.Namespace) -> None:
 
             # Calculate performance metrics and add them as span attributes
             metrics = calculate_metrics(
-                output["inputs"], output["outputs"], output["time"], tokenizer, output["stream"]
+                output["inputs"],
+                output["outputs"],
+                output["time"],
+                tokenizer,
+                output["stream"],
             )
             # Add metrics as a single JSON blob attribute
             if span:
@@ -985,5 +1186,5 @@ def main() -> None:
         raise ValueError(f"Invalid subcommand {args.subcommand}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

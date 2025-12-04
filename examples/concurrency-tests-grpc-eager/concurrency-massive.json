@@ -1,0 +1,19 @@
+{
+    "backend": "openai-grpc",
+    "base_url": "grpc://localhost:9000",
+    "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "seed": 123123,
+    "tokenizer": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "dataset_name": "sharegpt",
+    "num_of_req": 1500,
+    "max_concurrent": 300,
+    "request_rate": 600,
+    "request_distribution": [
+        "poisson",
+        600
+    ],
+    "temperature": 0.0,
+    "disable_stream": false,
+    "num_validation_reqs": 5,
+    "output_file": "concurrency-massive-eager-results.json"
+}

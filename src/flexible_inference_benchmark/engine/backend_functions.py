@@ -1,28 +1,37 @@
 # Taken from vLLM benchmarks
 # pylint: disable=too-many-positional-arguments
+import asyncio
 import json
+import logging
 import os
 import sys
 import time
 import traceback
-from typing import List, Optional, Dict, Any
 from contextlib import nullcontext
-from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
+import uuid
+
 import aiohttp
-from tqdm.asyncio import tqdm
+import grpc
 from opentelemetry import trace
+from pydantic import BaseModel, Field
+from tqdm.asyncio import tqdm
+
+from flexible_inference_benchmark.grpc.proto import openai_pb2, openai_pb2_grpc
 from flexible_inference_benchmark.utils.telemetry import create_span_attributes
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 # Get the tracer
 tracer = trace.get_tracer(__name__)
+logger = logging.getLogger(__name__)
 
 
 class bcolors:
-    OKBLUE = '\033[94m'
-    OKGREEN = '\033[92m'
-    ENDC = '\033[0m'
+    OKBLUE = "\033[94m"
+    OKGREEN = "\033[92m"
+    ENDC = "\033[0m"
 
 
 class RequestFuncInput(BaseModel):
@@ -48,6 +57,9 @@ class RequestFuncInput(BaseModel):
     disable_thinking: bool = False
     json_schema: Optional[Dict[str, Any]] = None
     include_schema_in_prompt: bool = False
+    force_new_grpc_connection: bool = False
+    force_new_http_connection: bool = False
+    http_connection_pool_limit: Optional[int] = None
 
 
 class RequestFuncOutput(BaseModel):
@@ -59,6 +71,540 @@ class RequestFuncOutput(BaseModel):
     prompt_len: int = 0
     error: str = ""
     output_len: Optional[int] = None
+
+
+class GrpcChannelPool:
+    """
+    A pool of gRPC channels for load distribution across multiple HTTP/2 connections.
+
+    This helps avoid HOL blocking and improves throughput at high concurrency by
+    distributing requests across multiple channels instead of multiplexing everything
+    on a single HTTP/2 connection.
+
+    Supports two modes:
+    - Eager (default): Pre-establishes all channels during initialize() for lowest latency
+    - Lazy: Creates channels on-demand during get_stub() for fair comparison with HTTP
+    """
+
+    def __init__(self, target: str, pool_size: int = 1, lazy: bool = True) -> None:
+        self._target = target
+        self._pool_size = max(1, pool_size)
+        self._lazy = lazy
+        self._channels: List[Optional[grpc.aio.Channel]] = []
+        self._stubs: List[Optional[openai_pb2_grpc.VLLMServiceStub]] = []
+        self._channel_locks: List[asyncio.Lock] = []
+        self._index = 0
+        self._lock = asyncio.Lock()
+        self._initialized = False
+
+    async def initialize(self) -> None:
+        """Initialize the channel pool.
+
+        In eager mode (lazy=False): Pre-establishes all channels and waits for them to be ready.
+        In lazy mode (lazy=True): Only allocates slots, channels are created on first use.
+        """
+        async with self._lock:
+            if self._initialized:
+                return
+
+            if self._lazy:
+                # Lazy mode: just allocate slots, channels will be created on-demand
+                logger.info(
+                    f"Initializing gRPC channel pool with {self._pool_size} slots (lazy mode) to {self._target}"
+                )
+                self._channels = [None] * self._pool_size
+                self._stubs = [None] * self._pool_size
+                self._channel_locks = [asyncio.Lock() for _ in range(self._pool_size)]
+                self._initialized = True
+                logger.info(
+                    f"gRPC channel pool initialized: {self._pool_size} slots ready (lazy, connections on-demand)"
+                )
+            else:
+                # Eager mode: pre-establish all channels
+                logger.info(
+                    f"Initializing gRPC channel pool with {self._pool_size} channels to {self._target}"
+                )
+
+                for i in range(self._pool_size):
+                    channel = grpc.aio.insecure_channel(self._target)
+                    await channel.channel_ready()
+                    stub = openai_pb2_grpc.VLLMServiceStub(channel)
+                    self._channels.append(channel)
+                    self._stubs.append(stub)
+                    self._channel_locks.append(asyncio.Lock())
+                    logger.debug(f"gRPC channel {i + 1}/{self._pool_size} ready")
+
+                self._initialized = True
+                logger.info(
+                    f"gRPC channel pool initialized: {self._pool_size} channels ready (eager)"
+                )
+
+    async def get_stub_async(self) -> openai_pb2_grpc.VLLMServiceStub:
+        """Get the next stub using round-robin selection (async version for lazy mode)."""
+        if not self._initialized:
+            raise RuntimeError(
+                "GrpcChannelPool not initialized. Call initialize() first."
+            )
+
+        # Thread-safe round-robin (atomic increment with modulo)
+        idx = self._index % self._pool_size
+        self._index += 1
+
+        if self._lazy:
+            # Lazy mode: create channel on-demand if not exists
+            if self._stubs[idx] is None:
+                async with self._channel_locks[idx]:
+                    # Double-check after acquiring lock
+                    if self._stubs[idx] is None:
+                        channel = grpc.aio.insecure_channel(self._target)
+                        # Note: We don't wait for channel_ready() in lazy mode
+                        # to match HTTP behavior where connection is established during request
+                        stub = openai_pb2_grpc.VLLMServiceStub(channel)
+                        self._channels[idx] = channel
+                        self._stubs[idx] = stub
+                        logger.debug(
+                            f"gRPC channel {idx + 1}/{self._pool_size} created on-demand (lazy)"
+                        )
+            return self._stubs[idx]  # type: ignore
+        else:
+            # Eager mode: channels already exist
+            return self._stubs[idx]  # type: ignore
+
+    def get_stub(self) -> openai_pb2_grpc.VLLMServiceStub:
+        """Get the next stub using round-robin selection (sync version, eager mode only)."""
+        if not self._initialized:
+            raise RuntimeError(
+                "GrpcChannelPool not initialized. Call initialize() first."
+            )
+
+        if self._lazy:
+            raise RuntimeError("Use get_stub_async() for lazy mode pools.")
+
+        # Thread-safe round-robin (atomic increment with modulo)
+        idx = self._index % self._pool_size
+        self._index += 1
+        return self._stubs[idx]  # type: ignore
+
+    async def close(self) -> None:
+        """Close all channels in the pool."""
+        async with self._lock:
+            for channel in self._channels:
+                if channel is not None:
+                    await channel.close()
+            self._channels.clear()
+            self._stubs.clear()
+            self._channel_locks.clear()
+            self._initialized = False
+            self._index = 0
+            logger.info("gRPC channel pool closed")
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+    @property
+    def is_lazy(self) -> bool:
+        return self._lazy
+
+
+# Global channel pool registry: target -> pool
+_GRPC_CHANNEL_POOLS: Dict[str, GrpcChannelPool] = {}
+_GRPC_POOL_LOCK = asyncio.Lock()
+
+# Legacy single-channel storage (kept for backward compatibility)
+_GRPC_STUBS: Dict[Tuple[str, int], openai_pb2_grpc.VLLMServiceStub] = {}
+_GRPC_CHANNELS: Dict[Tuple[str, int], grpc.aio.Channel] = {}
+_GRPC_STUB_LOCK = asyncio.Lock()
+
+
+class HttpSessionPool:
+    """
+    A pool of HTTP sessions for efficient connection reuse.
+
+    Unlike creating a new ClientSession per request, this pool maintains
+    a shared session with a properly configured connection pool, allowing
+    true connection reuse across requests.
+
+    This addresses the architectural issue where each request was creating
+    a new ClientSession, preventing effective connection pooling even when
+    TCPConnector was configured with a limit parameter.
+    """
+
+    def __init__(self, pool_size: int = 100, force_close: bool = False) -> None:
+        self._pool_size = max(1, pool_size)
+        self._force_close = force_close
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._lock = asyncio.Lock()
+        self._initialized = False
+
+    async def initialize(self) -> None:
+        """Initialize the shared session with connection pool."""
+        async with self._lock:
+            if self._initialized:
+                return
+
+            connector_kwargs: Dict[str, Any] = {
+                "limit": self._pool_size,
+            }
+            if self._force_close:
+                connector_kwargs["force_close"] = True
+
+            connector = aiohttp.TCPConnector(**connector_kwargs)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=AIOHTTP_TIMEOUT,
+            )
+            self._initialized = True
+            logger.info(
+                f"HTTP session pool initialized with limit={self._pool_size}, force_close={self._force_close}"
+            )
+
+    def get_session(self) -> aiohttp.ClientSession:
+        """Get the shared session."""
+        if not self._initialized or self._session is None:
+            raise RuntimeError(
+                "HttpSessionPool not initialized. Call initialize() first."
+            )
+        return self._session
+
+    async def close(self) -> None:
+        """Close the shared session."""
+        async with self._lock:
+            if self._session is not None:
+                await self._session.close()
+                self._session = None
+            self._initialized = False
+            logger.info("HTTP session pool closed")
+
+    @property
+    def pool_size(self) -> int:
+        return self._pool_size
+
+    @property
+    def is_initialized(self) -> bool:
+        return self._initialized
+
+
+# Global HTTP session pool registry: base_url -> pool
+_HTTP_SESSION_POOLS: Dict[str, HttpSessionPool] = {}
+_HTTP_POOL_LOCK = asyncio.Lock()
+
+
+async def initialize_http_session_pool(
+    base_url: str, pool_size: int, force_close: bool = False
+) -> HttpSessionPool:
+    """
+    Initialize an HTTP session pool for the given base URL.
+
+    Args:
+        base_url: The base URL for the HTTP server
+        pool_size: Number of connections in the pool (typically matches max_concurrent)
+        force_close: If True, forces connections to close after each request
+
+    Returns:
+        The initialized HttpSessionPool instance.
+    """
+    async with _HTTP_POOL_LOCK:
+        if base_url in _HTTP_SESSION_POOLS:
+            existing_pool = _HTTP_SESSION_POOLS[base_url]
+            if existing_pool.is_initialized:
+                if existing_pool.pool_size == pool_size:
+                    return existing_pool
+                # Pool size changed, close old pool and create new one
+                await existing_pool.close()
+
+        pool = HttpSessionPool(pool_size, force_close)
+        await pool.initialize()
+        _HTTP_SESSION_POOLS[base_url] = pool
+        return pool
+
+
+async def close_http_session_pools() -> None:
+    """Close all HTTP session pools."""
+    async with _HTTP_POOL_LOCK:
+        for pool in _HTTP_SESSION_POOLS.values():
+            await pool.close()
+        _HTTP_SESSION_POOLS.clear()
+        logger.info("All HTTP session pools closed")
+
+
+def get_http_session_pool(base_url: str) -> Optional[HttpSessionPool]:
+    """Get an existing HTTP session pool for the given base URL, if any."""
+    return _HTTP_SESSION_POOLS.get(base_url)
+
+
+def _extract_base_url(api_url: str) -> str:
+    """Extract base URL (scheme://host:port) from a full API URL."""
+    parsed = urlparse(api_url)
+    port_part = f":{parsed.port}" if parsed.port else ""
+    return f"{parsed.scheme}://{parsed.hostname}{port_part}"
+
+
+class _HttpSessionContext:
+    """
+    Context manager for HTTP session handling.
+
+    If a shared session pool exists, uses the pooled session (no cleanup on exit).
+    Otherwise, creates a new session and cleans it up on exit.
+    """
+
+    def __init__(
+        self,
+        request_func_input: RequestFuncInput,
+        cookies: Optional[Dict[str, str]] = None,
+    ):
+        self._request_func_input = request_func_input
+        self._cookies = cookies
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._owns_session = (
+            False  # True if we created the session and need to close it
+        )
+
+    async def __aenter__(self) -> aiohttp.ClientSession:
+        # If force_new_http_connection is requested, always create a new session
+        if self._request_func_input.force_new_http_connection:
+            self._session = aiohttp.ClientSession(
+                **_build_http_session_kwargs(self._request_func_input, self._cookies)
+            )
+            self._owns_session = True
+            return self._session
+
+        # If cookies are provided, create a new session to ensure cookies are applied
+        # (shared session pool doesn't support per-request cookies)
+        if self._cookies:
+            self._session = aiohttp.ClientSession(
+                **_build_http_session_kwargs(self._request_func_input, self._cookies)
+            )
+            self._owns_session = True
+            return self._session
+
+        # Try to use shared session pool
+        base_url = _extract_base_url(self._request_func_input.api_url)
+        pool = get_http_session_pool(base_url)
+
+        if pool is not None and pool.is_initialized:
+            self._session = pool.get_session()
+            self._owns_session = False
+            return self._session
+
+        # Fallback: create a new session (legacy behavior)
+        self._session = aiohttp.ClientSession(
+            **_build_http_session_kwargs(self._request_func_input, self._cookies)
+        )
+        self._owns_session = True
+        return self._session
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._owns_session and self._session is not None:
+            await self._session.close()
+
+
+async def initialize_grpc_channel_pool(
+    api_url: str, pool_size: int, lazy: bool = True
+) -> GrpcChannelPool:
+    """
+    Initialize a gRPC channel pool for the given target URL.
+
+    Args:
+        api_url: The gRPC server URL (e.g., "grpc://localhost:9000")
+        pool_size: Number of channels in the pool (typically matches max_concurrent)
+        lazy: If True, channels are created on-demand (like HTTP). If False (default),
+              all channels are pre-established for lowest latency.
+
+    Returns:
+        The initialized GrpcChannelPool instance.
+    """
+    target = _normalize_grpc_target(api_url)
+
+    async with _GRPC_POOL_LOCK:
+        if target in _GRPC_CHANNEL_POOLS:
+            existing_pool = _GRPC_CHANNEL_POOLS[target]
+            if existing_pool.is_initialized:
+                if (
+                    existing_pool.pool_size == pool_size
+                    and existing_pool.is_lazy == lazy
+                ):
+                    return existing_pool
+                # Pool size or lazy mode changed, close old pool and create new one
+                await existing_pool.close()
+
+        pool = GrpcChannelPool(target, pool_size, lazy=lazy)
+        await pool.initialize()
+        _GRPC_CHANNEL_POOLS[target] = pool
+        return pool
+
+
+async def close_grpc_channel_pools() -> None:
+    """Close all gRPC channel pools."""
+    async with _GRPC_POOL_LOCK:
+        for pool in _GRPC_CHANNEL_POOLS.values():
+            await pool.close()
+        _GRPC_CHANNEL_POOLS.clear()
+        logger.info("All gRPC channel pools closed")
+
+
+def _build_http_session_kwargs(
+    request_func_input: RequestFuncInput, cookies: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    session_kwargs: Dict[str, Any] = {"timeout": AIOHTTP_TIMEOUT}
+    if cookies:
+        session_kwargs["cookies"] = cookies
+
+    # Build TCPConnector with appropriate settings
+    connector_kwargs: Dict[str, Any] = {}
+
+    if request_func_input.force_new_http_connection:
+        connector_kwargs["force_close"] = True
+
+    if request_func_input.http_connection_pool_limit is not None:
+        connector_kwargs["limit"] = request_func_input.http_connection_pool_limit
+
+    if connector_kwargs:
+        session_kwargs["connector"] = aiohttp.TCPConnector(**connector_kwargs)
+
+    return session_kwargs
+
+
+def _build_http_request_headers(
+    request_func_input: RequestFuncInput, base_headers: Optional[Dict[str, str]] = None
+) -> Optional[Dict[str, str]]:
+    """
+    Construct per-request headers, injecting Connection: close when forcing new sockets.
+    """
+    headers: Dict[str, str] = {}
+    if base_headers:
+        headers.update(base_headers)
+    if request_func_input.force_new_http_connection:
+        headers["Connection"] = "close"
+    return headers or None
+
+
+def _normalize_grpc_target(api_url: str) -> str:
+    if not api_url:
+        raise ValueError("gRPC base URL must be provided.")
+    candidate = api_url if "://" in api_url else f"grpc://{api_url}"
+    parsed = urlparse(candidate)
+    host = parsed.hostname
+    if host is None:
+        path_host = parsed.path.lstrip("/")
+        host = path_host.split("/")[0] if path_host else None
+    port = parsed.port
+    if host is None or port is None:
+        raise ValueError(
+            f"Invalid gRPC base URL '{api_url}'. Expected format like grpc://host:port"
+        )
+    return f"{host}:{port}"
+
+
+async def _get_grpc_stub(
+    api_url: str, force_new_connection: bool = False
+) -> Tuple[openai_pb2_grpc.VLLMServiceStub, Optional[grpc.aio.Channel]]:
+    target = _normalize_grpc_target(api_url)
+
+    if force_new_connection:
+        # Force a new connection by passing a unique channel argument.
+        # This prevents gRPC C-core from reusing existing subchannels to the same target.
+        unique_opt = [("fib.channel_id", str(uuid.uuid4()))]
+        channel = grpc.aio.insecure_channel(target, options=unique_opt)
+        # We don't wait for channel ready here to avoid overhead, trusting gRPC to connect.
+        # Also we don't cache it.
+        stub = openai_pb2_grpc.VLLMServiceStub(channel)
+        return stub, channel
+
+    # Try to use channel pool first (if initialized)
+    if target in _GRPC_CHANNEL_POOLS:
+        pool = _GRPC_CHANNEL_POOLS[target]
+        if pool.is_initialized:
+            # Use async version for lazy mode, sync version for eager mode
+            if pool.is_lazy:
+                stub = await pool.get_stub_async()
+            else:
+                stub = pool.get_stub()
+            return stub, None  # No channel to close, pool manages lifecycle
+
+    # Fallback to legacy single-channel behavior
+    loop = asyncio.get_running_loop()
+    key = (target, id(loop))
+    async with _GRPC_STUB_LOCK:
+        if key in _GRPC_STUBS:
+            return _GRPC_STUBS[key], None
+        channel = grpc.aio.insecure_channel(target)
+        await channel.channel_ready()
+        stub = openai_pb2_grpc.VLLMServiceStub(channel)
+        _GRPC_CHANNELS[key] = channel
+        _GRPC_STUBS[key] = stub
+        return stub, None
+
+
+def _build_grpc_completion_request(
+    request_func_input: RequestFuncInput,
+) -> openai_pb2.CompletionRequest:
+    request = openai_pb2.CompletionRequest(
+        model=request_func_input.model,
+        prompt=request_func_input.prompt,
+    )
+    request.max_tokens = int(request_func_input.output_len)
+    request.stream = request_func_input.stream
+    request.temperature = max(0.0, request_func_input.temperature)
+    if request_func_input.top_p is not None:
+        request.top_p = float(request_func_input.top_p)
+    if request_func_input.top_k is not None:
+        request.top_k = int(request_func_input.top_k)
+    if request_func_input.best_of > 1:
+        request.best_of = int(request_func_input.best_of)
+    if request_func_input.logprobs is not None:
+        request.logprobs = True
+        request.top_logprobs = int(request_func_input.logprobs)
+    return request
+
+
+def _build_grpc_chat_request(
+    request_func_input: RequestFuncInput,
+) -> openai_pb2.ChatCompletionRequest:
+    content = request_func_input.prompt
+    if request_func_input.media:
+        media_lines = "\n".join(f"[Image: {item}]" for item in request_func_input.media)
+        content = f"{content}\n{media_lines}" if content else media_lines
+
+    append_msg = ""
+    if request_func_input.custom_prompt:
+        append_msg += request_func_input.custom_prompt
+    if request_func_input.include_schema_in_prompt and request_func_input.json_schema:
+        if append_msg:
+            append_msg += "\n\n"
+        append_msg += "Please follow this JSON schema for your response:\n```json\n"
+        append_msg += json.dumps(request_func_input.json_schema, indent=2)
+        append_msg += "\n```"
+    if request_func_input.json_response and not request_func_input.json_schema:
+        if append_msg:
+            append_msg += "\n\n"
+        append_msg += "Please respond with a valid JSON object."
+    if append_msg:
+        content = f"{content}\n\n{append_msg}" if content else append_msg
+
+    messages = [openai_pb2.ChatMessage(role="user", content=content)]
+    request = openai_pb2.ChatCompletionRequest(
+        model=request_func_input.model, messages=messages
+    )
+    request.max_tokens = int(request_func_input.output_len)
+    request.stream = request_func_input.stream
+    request.temperature = max(0.0, request_func_input.temperature)
+    if request_func_input.top_p is not None:
+        request.top_p = float(request_func_input.top_p)
+    if request_func_input.top_k is not None:
+        request.top_k = int(request_func_input.top_k)
+    if request_func_input.best_of > 1:
+        request.best_of = int(request_func_input.best_of)
+    if request_func_input.use_beam_search:
+        request.use_beam_search = True
+    if request_func_input.logprobs is not None:
+        request.logprobs = True
+        request.top_logprobs = int(request_func_input.logprobs)
+    return request
 
 
 def apply_sampling_params(
@@ -83,12 +629,16 @@ def apply_sampling_params(
 
 
 async def async_request_tgi(
-    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         assert not request_func_input.use_beam_search
         assert request_func_input.logprobs is None
         params = {
@@ -107,7 +657,12 @@ async def async_request_tgi(
         if verbose:
             print_verbose(idx, request_func_input, st, 0, 0, True)
         try:
-            async with session.post(url=api_url, json=payload, ssl=request_func_input.ssl) as response:
+            async with session.post(
+                url=api_url,
+                json=payload,
+                ssl=request_func_input.ssl,
+                headers=_build_http_request_headers(request_func_input),
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -134,7 +689,14 @@ async def async_request_tgi(
                     output.generated_text = data["generated_text"]
 
                     if verbose:
-                        print_verbose(idx, request_func_input, 0, most_recent_timestamp, output.latency, False)
+                        print_verbose(
+                            idx,
+                            request_func_input,
+                            0,
+                            most_recent_timestamp,
+                            output.latency,
+                            False,
+                        )
 
         except aiohttp.ClientConnectorError:
             output.success = False
@@ -151,12 +713,16 @@ async def async_request_tgi(
 
 
 async def async_request_trt_llm(
-    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     assert api_url.endswith("generate_stream")
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         assert not request_func_input.use_beam_search
         assert request_func_input.best_of == 1
         assert request_func_input.logprobs is None
@@ -177,7 +743,12 @@ async def async_request_trt_llm(
         if verbose:
             print_verbose(idx, request_func_input, most_recent_timestamp, 0, 0, True)
         try:
-            async with session.post(url=api_url, json=payload, ssl=request_func_input.ssl) as response:
+            async with session.post(
+                url=api_url,
+                json=payload,
+                ssl=request_func_input.ssl,
+                headers=_build_http_request_headers(request_func_input),
+            ) as response:
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -203,7 +774,14 @@ async def async_request_trt_llm(
                     output.latency = most_recent_timestamp - st
                     output.success = True
                     if verbose:
-                        print_verbose(idx, request_func_input, 0, most_recent_timestamp, output.latency, False)
+                        print_verbose(
+                            idx,
+                            request_func_input,
+                            0,
+                            most_recent_timestamp,
+                            output.latency,
+                            False,
+                        )
 
                 else:
                     output.error = response.reason or ""
@@ -224,13 +802,20 @@ async def async_request_trt_llm(
 
 
 async def async_request_deepspeed_mii(
-    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
 ) -> RequestFuncOutput:
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         assert request_func_input.best_of == 1
         assert not request_func_input.use_beam_search
         assert request_func_input.logprobs is None
-        payload = {"prompt": request_func_input.prompt, "max_tokens": request_func_input.output_len}
+        payload = {
+            "prompt": request_func_input.prompt,
+            "max_tokens": request_func_input.output_len,
+        }
         apply_sampling_params(payload, request_func_input, temp_min=0.01)
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
@@ -245,7 +830,10 @@ async def async_request_deepspeed_mii(
             print_verbose(idx, request_func_input, st, 0, 0, True)
         try:
             async with session.post(
-                url=request_func_input.api_url, json=payload, ssl=request_func_input.ssl
+                url=request_func_input.api_url,
+                json=payload,
+                ssl=request_func_input.ssl,
+                headers=_build_http_request_headers(request_func_input),
             ) as response:
                 if response.status == 200:
                     parsed_resp = await response.json()
@@ -254,7 +842,9 @@ async def async_request_deepspeed_mii(
                     output.generated_text = parsed_resp["text"][0]
                     output.success = True
                     if verbose:
-                        print_verbose(idx, request_func_input, 0, rcv_time, output.latency, False)
+                        print_verbose(
+                            idx, request_func_input, 0, rcv_time, output.latency, False
+                        )
                 else:
                     output.error = response.reason or ""
                     output.success = False
@@ -274,14 +864,22 @@ async def async_request_deepspeed_mii(
 
 
 async def async_request_openai_completions(
-    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith("v1/completions"), "OpenAI Completions API URL must end with 'v1/completions'."
+    assert api_url.endswith("v1/completions"), (
+        "OpenAI Completions API URL must end with 'v1/completions'."
+    )
     assert not request_func_input.use_beam_search
 
     if request_func_input.stream:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with _HttpSessionContext(
+            request_func_input, request_func_input.cookies
+        ) as session:
             payload = {
                 "model": request_func_input.model,
                 "prompt": request_func_input.prompt,
@@ -294,7 +892,10 @@ async def async_request_openai_completions(
             apply_sampling_params(payload, request_func_input, always_top_p=False)
             if request_func_input.logprobs is not None:
                 payload["logprobs"] = int(request_func_input.logprobs)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            headers = _build_http_request_headers(
+                request_func_input,
+                {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -308,7 +909,10 @@ async def async_request_openai_completions(
                 print_verbose(idx, request_func_input, st, 0, 0, True)
             try:
                 async with session.post(
-                    url=api_url, json=payload, headers=headers, ssl=request_func_input.ssl
+                    url=api_url,
+                    json=payload,
+                    headers=headers,
+                    ssl=request_func_input.ssl,
                 ) as response:
                     if response.status == 200:
                         async for chunk_bytes in response.content:
@@ -322,7 +926,10 @@ async def async_request_openai_completions(
                             else:
                                 data = json.loads(chunk)
 
-                                if len(data["choices"]) > 0 and data["choices"][0]["text"] is not None:
+                                if (
+                                    len(data["choices"]) > 0
+                                    and data["choices"][0]["text"] is not None
+                                ):
                                     timestamp = time.perf_counter()
                                     # First token
                                     if ttft == 0.0:
@@ -334,28 +941,39 @@ async def async_request_openai_completions(
                                     # usage summary response without a token so we
                                     # do not want to include as inter-token-latency
                                     elif data.get("usage", None) is None:
-                                        output.itl.append(timestamp - most_recent_timestamp)
+                                        output.itl.append(
+                                            timestamp - most_recent_timestamp
+                                        )
 
                                     most_recent_timestamp = timestamp
                                     generated_text += data["choices"][0]["text"]
 
                                 if data["usage"]:
                                     if "completion_tokens" in data["usage"]:
-                                        output.output_len = int(data["usage"]["completion_tokens"])
+                                        output.output_len = int(
+                                            data["usage"]["completion_tokens"]
+                                        )
                                     if "prompt_tokens" in data["usage"]:
-                                        output.prompt_len = int(data["usage"]["prompt_tokens"])
+                                        output.prompt_len = int(
+                                            data["usage"]["prompt_tokens"]
+                                        )
 
                         output.generated_text = generated_text
                         output.success = True
                         output.latency = latency
 
                         if verbose:
-                            print_verbose(idx, request_func_input, 0, most_recent_timestamp, latency, False)
+                            print_verbose(
+                                idx,
+                                request_func_input,
+                                0,
+                                most_recent_timestamp,
+                                latency,
+                                False,
+                            )
                     else:
                         output.success = False
-                        output.error = (
-                            f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
-                        )
+                        output.error = f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
             except aiohttp.ClientConnectorError:
                 output.success = False
                 output.error = "connection error, please verify the server is running"
@@ -366,7 +984,9 @@ async def async_request_openai_completions(
                 exc_info = sys.exc_info()
                 output.error += "".join(traceback.format_exception(*exc_info))
     else:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with _HttpSessionContext(
+            request_func_input, request_func_input.cookies
+        ) as session:
             payload = {
                 "model": request_func_input.model,
                 "prompt": request_func_input.prompt,
@@ -378,7 +998,10 @@ async def async_request_openai_completions(
             apply_sampling_params(payload, request_func_input, always_top_p=False)
             if request_func_input.logprobs is not None:
                 payload["logprobs"] = int(request_func_input.logprobs)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            headers = _build_http_request_headers(
+                request_func_input,
+                {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+            )
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
             output.ttft = 0
@@ -388,7 +1011,10 @@ async def async_request_openai_completions(
                 print_verbose(idx, request_func_input, st, 0, 0, True)
             try:
                 async with session.post(
-                    url=api_url, json=payload, headers=headers, ssl=request_func_input.ssl
+                    url=api_url,
+                    json=payload,
+                    headers=headers,
+                    ssl=request_func_input.ssl,
                 ) as response:
                     if response.status == 200:
                         parsed_resp = await response.json()
@@ -397,17 +1023,26 @@ async def async_request_openai_completions(
                         output.generated_text = parsed_resp["choices"][0]["text"]
                         output.success = True
                         if verbose:
-                            print_verbose(idx, request_func_input, 0, rcv_time, output.latency, False)
+                            print_verbose(
+                                idx,
+                                request_func_input,
+                                0,
+                                rcv_time,
+                                output.latency,
+                                False,
+                            )
                         if parsed_resp.get("usage", None):
                             if "completion_tokens" in parsed_resp["usage"]:
-                                output.output_len = int(parsed_resp["usage"]["completion_tokens"])
+                                output.output_len = int(
+                                    parsed_resp["usage"]["completion_tokens"]
+                                )
                             if "prompt_tokens" in parsed_resp["usage"]:
-                                output.prompt_len = int(parsed_resp["usage"]["prompt_tokens"])
+                                output.prompt_len = int(
+                                    parsed_resp["usage"]["prompt_tokens"]
+                                )
                     else:
                         output.success = False
-                        output.error = (
-                            f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
-                        )
+                        output.error = f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
 
             except aiohttp.ClientConnectorError:
                 output.success = False
@@ -423,17 +1058,27 @@ async def async_request_openai_completions(
 
 
 async def async_request_openai_chat_completions(
-    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith(
-        "v1/chat/completions"
-    ), "OpenAI Chat Completions API URL must end with 'v1/chat/completions'."
+    assert api_url.endswith("v1/chat/completions"), (
+        "OpenAI Chat Completions API URL must end with 'v1/chat/completions'."
+    )
 
-    content_body: List[dict[str, Any]] = [{"type": "text", "text": request_func_input.prompt}]
-
-    for media_item in request_func_input.media:
-        content_body.append({"type": "image_url", "image_url": {"url": media_item}})
+    # Use array format only when media is present, otherwise use string format
+    # (for compatibility with servers that don't support multimodal content format)
+    if request_func_input.media:
+        content_body: List[dict[str, Any]] = [
+            {"type": "text", "text": request_func_input.prompt}
+        ]
+        for media_item in request_func_input.media:
+            content_body.append({"type": "image_url", "image_url": {"url": media_item}})
+    else:
+        content_body = request_func_input.prompt  # type: ignore
 
     telemetry_enabled = os.getenv("OTEL_ENABLED", "false").lower() == "true"
     otel_span = (
@@ -441,17 +1086,22 @@ async def async_request_openai_chat_completions(
             f"request_{idx}",
             attributes=create_span_attributes(
                 prompt_tokens=request_func_input.prompt_len,
-                image_count=len(request_func_input.media) if request_func_input.media else 0,
-                image_sizes=[len(img) for img in request_func_input.media] if request_func_input.media else [],
+                image_count=len(request_func_input.media)
+                if request_func_input.media
+                else 0,
+                image_sizes=[len(img) for img in request_func_input.media]
+                if request_func_input.media
+                else [],
                 response_tokens=0,  # Will be updated after response
-                run_id=request_func_input.run_id or "unknown",  # Provide default value for None
+                run_id=request_func_input.run_id
+                or "unknown",  # Provide default value for None
             ),
         )
         if telemetry_enabled
         else nullcontext()
     )
     with otel_span as span:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+        async with _HttpSessionContext(request_func_input) as session:
             assert not request_func_input.use_beam_search
 
             # Apply custom prompt and schema formatting
@@ -462,10 +1112,15 @@ async def async_request_openai_chat_completions(
                 append_msg += request_func_input.custom_prompt
 
             # 2. Include schema in prompt if requested
-            if request_func_input.include_schema_in_prompt and request_func_input.json_schema:
+            if (
+                request_func_input.include_schema_in_prompt
+                and request_func_input.json_schema
+            ):
                 if append_msg:
                     append_msg += "\n\n"
-                append_msg += "Please follow this JSON schema for your response:\n```json\n"
+                append_msg += (
+                    "Please follow this JSON schema for your response:\n```json\n"
+                )
                 append_msg += json.dumps(request_func_input.json_schema, indent=2)
                 append_msg += "\n```"
 
@@ -488,7 +1143,11 @@ async def async_request_openai_chat_completions(
             if request_func_input.json_schema:
                 payload["response_format"] = {
                     "type": "json_schema",
-                    "json_schema": {"name": "response", "schema": request_func_input.json_schema, "strict": True},
+                    "json_schema": {
+                        "name": "response",
+                        "schema": request_func_input.json_schema,
+                        "strict": True,
+                    },
                 }
             elif request_func_input.json_response:
                 payload["response_format"] = {"type": "json_object"}
@@ -503,10 +1162,13 @@ async def async_request_openai_chat_completions(
             if request_func_input.logprobs is not None:
                 payload["logprobs"] = True
                 payload["top_logprobs"] = int(request_func_input.logprobs)
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
-            }
+            headers = _build_http_request_headers(
+                request_func_input,
+                {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+                },
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -519,11 +1181,16 @@ async def async_request_openai_chat_completions(
                 print_verbose(idx, request_func_input, st, 0, 0, True)
             try:
                 tracer_http_request = (
-                    tracer.start_as_current_span("http_request") if telemetry_enabled else nullcontext()
+                    tracer.start_as_current_span("http_request")
+                    if telemetry_enabled
+                    else nullcontext()
                 )
                 with tracer_http_request:
                     async with session.post(
-                        url=api_url, json=payload, headers=headers, ssl=request_func_input.ssl
+                        url=api_url,
+                        json=payload,
+                        headers=headers,
+                        ssl=request_func_input.ssl,
                     ) as response:
                         if response.status == 200:
                             latency = 0.0
@@ -538,7 +1205,9 @@ async def async_request_openai_chat_completions(
                                     if not chunk_bytes:
                                         continue
 
-                                    chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                                    chunk = remove_prefix(
+                                        chunk_bytes.decode("utf-8"), "data: "
+                                    )
                                     if chunk == "[DONE]":
                                         latency = time.perf_counter() - st
                                     else:
@@ -547,25 +1216,43 @@ async def async_request_openai_chat_completions(
                                         delta = None
                                         content = None
                                         reasoning_content = None
-                                        if request_func_input.stream and "choices" in data and len(data["choices"]) > 0:
+                                        if (
+                                            request_func_input.stream
+                                            and "choices" in data
+                                            and len(data["choices"]) > 0
+                                        ):
                                             delta = data["choices"][0]["delta"]
                                             content = delta.get("content", None)
-                                            reasoning_content = delta.get("reasoning_content", None)
+                                            reasoning_content = delta.get(
+                                                "reasoning_content", None
+                                            )
 
-                                        if (content is not None or reasoning_content is not None) and not (
-                                            ttft == 0.0 and (content == '' or reasoning_content == '')
+                                        if (
+                                            content is not None
+                                            or reasoning_content is not None
+                                        ) and not (
+                                            ttft == 0.0
+                                            and (
+                                                content == "" or reasoning_content == ""
+                                            )
                                         ):
                                             if ttft == 0.0:
                                                 ttft = time.perf_counter() - st
                                                 output.ttft = ttft
                                                 if process_span:
-                                                    process_span.set_attribute("fib.time_to_first_token", ttft)
+                                                    process_span.set_attribute(
+                                                        "fib.time_to_first_token", ttft
+                                                    )
 
                                             else:
-                                                output.itl.append(timestamp - most_recent_timestamp)
+                                                output.itl.append(
+                                                    timestamp - most_recent_timestamp
+                                                )
                                                 if process_span:
                                                     process_span.set_attribute(
-                                                        "fib.inter_token_latency", timestamp - most_recent_timestamp
+                                                        "fib.inter_token_latency",
+                                                        timestamp
+                                                        - most_recent_timestamp,
                                                     )
                                             if content:
                                                 generated_text += content
@@ -573,27 +1260,47 @@ async def async_request_openai_chat_completions(
                                                 generated_text += reasoning_content
                                             most_recent_timestamp = timestamp
 
-                                        if "usage" in data and data["usage"] is not None:
+                                        if (
+                                            "usage" in data
+                                            and data["usage"] is not None
+                                        ):
                                             if data["usage"].get("completion_tokens"):
-                                                output.output_len = int(data["usage"]["completion_tokens"])
+                                                output.output_len = int(
+                                                    data["usage"]["completion_tokens"]
+                                                )
                                                 if process_span:
                                                     process_span.set_attribute(
-                                                        "fib.completion_tokens", output.output_len
+                                                        "fib.completion_tokens",
+                                                        output.output_len,
                                                     )
                                             if data["usage"].get("prompt_tokens"):
-                                                output.prompt_len = int(data["usage"]["prompt_tokens"])
+                                                output.prompt_len = int(
+                                                    data["usage"]["prompt_tokens"]
+                                                )
                                                 if process_span:
-                                                    process_span.set_attribute("fib.prompt_tokens", output.prompt_len)
+                                                    process_span.set_attribute(
+                                                        "fib.prompt_tokens",
+                                                        output.prompt_len,
+                                                    )
 
                             output.generated_text = generated_text
                             output.success = True
                             output.latency = latency
                             if span:
                                 span.set_attribute("fib.total_latency", latency)
-                                span.set_attribute("fib.total_tokens", len(generated_text))
+                                span.set_attribute(
+                                    "fib.total_tokens", len(generated_text)
+                                )
 
                             if verbose:
-                                print_verbose(idx, request_func_input, 0, most_recent_timestamp, output.latency, False)
+                                print_verbose(
+                                    idx,
+                                    request_func_input,
+                                    0,
+                                    most_recent_timestamp,
+                                    output.latency,
+                                    False,
+                                )
                         else:
                             output.error = response.reason or ""
                             output.success = False
@@ -614,31 +1321,240 @@ async def async_request_openai_chat_completions(
                     span.set_attribute("fib.error", output.error)
 
             if pbar:
-                pbar_span = tracer.start_as_current_span("progress_update") if telemetry_enabled else nullcontext()
+                pbar_span = (
+                    tracer.start_as_current_span("progress_update")
+                    if telemetry_enabled
+                    else nullcontext()
+                )
                 with pbar_span:
                     pbar.update(1)
 
             return output
 
 
+async def async_request_openai_grpc_completions(
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
+) -> RequestFuncOutput:
+    del wait_time
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    request_proto = _build_grpc_completion_request(request_func_input)
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    ttft = 0.0
+    generated_text = ""
+    if verbose:
+        print_verbose(idx, request_func_input, st, 0, 0, True)
+
+    channel = None
+    try:
+        stub, channel = await _get_grpc_stub(
+            request_func_input.api_url, request_func_input.force_new_grpc_connection
+        )
+        if request_func_input.stream:
+            stream = stub.CompletionStream(request_proto)
+            async for chunk in stream:
+                timestamp = time.perf_counter()
+                chunk_text = ""
+                finish_reason = ""
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    chunk_text = choice.text
+                    finish_reason = choice.finish_reason or ""
+                if chunk_text:
+                    if ttft == 0.0:
+                        ttft = timestamp - st
+                        output.ttft = ttft
+                    else:
+                        output.itl.append(timestamp - most_recent_timestamp)
+                    generated_text += chunk_text
+                    most_recent_timestamp = timestamp
+                if chunk.usage:
+                    if chunk.usage.prompt_tokens:
+                        output.prompt_len = int(chunk.usage.prompt_tokens)
+                    if chunk.usage.completion_tokens:
+                        output.output_len = int(chunk.usage.completion_tokens)
+                if finish_reason:
+                    break
+            output.latency = time.perf_counter() - st
+            output.generated_text = generated_text
+            output.success = True
+            if verbose:
+                print_verbose(
+                    idx,
+                    request_func_input,
+                    0,
+                    most_recent_timestamp,
+                    output.latency,
+                    False,
+                )
+        else:
+            response = await stub.Completion(request_proto)
+            rcv_time = time.perf_counter()
+            output.latency = rcv_time - st
+            if response.choices:
+                output.generated_text = response.choices[0].text
+            if response.usage:
+                if response.usage.prompt_tokens:
+                    output.prompt_len = int(response.usage.prompt_tokens)
+                if response.usage.completion_tokens:
+                    output.output_len = int(response.usage.completion_tokens)
+            output.ttft = 0.0
+            output.success = True
+            if verbose:
+                print_verbose(
+                    idx, request_func_input, 0, rcv_time, output.latency, False
+                )
+    except ValueError as exc:
+        output.success = False
+        output.error = str(exc)
+    except grpc.aio.AioRpcError as exc:
+        details = exc.details() or ""
+        error_msg = f"{exc.code().name}: {details}".strip()
+        output.success = False
+        output.error = error_msg
+    finally:
+        if channel:
+            await channel.close()
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
+async def async_request_openai_grpc_chat_completions(
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
+) -> RequestFuncOutput:
+    del wait_time
+    output = RequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    request_proto = _build_grpc_chat_request(request_func_input)
+    st = time.perf_counter()
+    most_recent_timestamp = st
+    ttft = 0.0
+    generated_text = ""
+    if verbose:
+        print_verbose(idx, request_func_input, st, 0, 0, True)
+
+    channel = None
+    try:
+        stub, channel = await _get_grpc_stub(
+            request_func_input.api_url, request_func_input.force_new_grpc_connection
+        )
+        if request_func_input.stream:
+            stream = stub.ChatCompletionStream(request_proto)
+            async for chunk in stream:
+                timestamp = time.perf_counter()
+                delta_text = ""
+                finish_reason = ""
+                if chunk.choices:
+                    choice = chunk.choices[0]
+                    finish_reason = choice.finish_reason or ""
+                    delta_obj = choice.delta
+                    delta_text = delta_obj.content or delta_obj.reasoning_content or ""
+                if delta_text:
+                    if ttft == 0.0:
+                        ttft = timestamp - st
+                        output.ttft = ttft
+                    else:
+                        output.itl.append(timestamp - most_recent_timestamp)
+                    generated_text += delta_text
+                    most_recent_timestamp = timestamp
+                if chunk.usage:
+                    if chunk.usage.prompt_tokens:
+                        output.prompt_len = int(chunk.usage.prompt_tokens)
+                    if chunk.usage.completion_tokens:
+                        output.output_len = int(chunk.usage.completion_tokens)
+                if finish_reason:
+                    break
+            output.latency = time.perf_counter() - st
+            output.generated_text = generated_text
+            output.success = True
+            if verbose:
+                print_verbose(
+                    idx,
+                    request_func_input,
+                    0,
+                    most_recent_timestamp,
+                    output.latency,
+                    False,
+                )
+        else:
+            response = await stub.ChatCompletion(request_proto)
+            rcv_time = time.perf_counter()
+            output.latency = rcv_time - st
+            if response.choices:
+                output.generated_text = response.choices[0].message.content
+            if response.usage:
+                if response.usage.prompt_tokens:
+                    output.prompt_len = int(response.usage.prompt_tokens)
+                if response.usage.completion_tokens:
+                    output.output_len = int(response.usage.completion_tokens)
+            output.ttft = 0.0
+            output.success = True
+            if verbose:
+                print_verbose(
+                    idx, request_func_input, 0, rcv_time, output.latency, False
+                )
+    except ValueError as exc:
+        output.success = False
+        output.error = str(exc)
+    except grpc.aio.AioRpcError as exc:
+        details = exc.details() or ""
+        error_msg = f"{exc.code().name}: {details}".strip()
+        output.success = False
+        output.error = error_msg
+    finally:
+        if channel:
+            await channel.close()
+
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 async def async_request_cserve_debug(
-    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith("v1/generate"), "CServe Completions API URL must end with 'v1/generate'."
+    assert api_url.endswith("v1/generate"), (
+        "CServe Completions API URL must end with 'v1/generate'."
+    )
     assert not request_func_input.use_beam_search
     assert request_func_input.logprobs is None
 
     if request_func_input.stream:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with _HttpSessionContext(
+            request_func_input, request_func_input.cookies
+        ) as session:
             payload = {
                 "prompt": request_func_input.prompt,
-                "sampling_params": {"n": 1, "max_tokens": request_func_input.output_len},
+                "sampling_params": {
+                    "n": 1,
+                    "max_tokens": request_func_input.output_len,
+                },
                 "stream": True,
                 "ignore_eos": request_func_input.ignore_eos,
             }
-            apply_sampling_params(payload["sampling_params"], request_func_input, always_top_p=False)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            apply_sampling_params(
+                payload["sampling_params"], request_func_input, always_top_p=False
+            )
+            headers = _build_http_request_headers(
+                request_func_input,
+                {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -651,7 +1567,10 @@ async def async_request_cserve_debug(
                 print_verbose(idx, request_func_input, st, 0, 0, True)
             try:
                 async with session.post(
-                    url=api_url, json=payload, headers=headers, ssl=request_func_input.ssl
+                    url=api_url,
+                    json=payload,
+                    headers=headers,
+                    ssl=request_func_input.ssl,
                 ) as response:
                     if response.status == 200:
                         async for chunk_bytes in response.content:
@@ -678,12 +1597,17 @@ async def async_request_cserve_debug(
                         output.latency = time.perf_counter() - st
 
                         if verbose:
-                            print_verbose(idx, request_func_input, 0, most_recent_timestamp, output.latency, False)
+                            print_verbose(
+                                idx,
+                                request_func_input,
+                                0,
+                                most_recent_timestamp,
+                                output.latency,
+                                False,
+                            )
                     else:
                         output.success = False
-                        output.error = (
-                            f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
-                        )
+                        output.error = f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
 
             except aiohttp.ClientConnectorError:
                 output.success = False
@@ -695,7 +1619,9 @@ async def async_request_cserve_debug(
                 output.error = "".join(traceback.format_exception(*exc_info))
 
     else:
-        async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT, cookies=request_func_input.cookies) as session:
+        async with _HttpSessionContext(
+            request_func_input, request_func_input.cookies
+        ) as session:
             payload = {
                 "prompt": request_func_input.prompt,
                 "sampling_params": {
@@ -705,8 +1631,13 @@ async def async_request_cserve_debug(
                 },
                 "stream": False,
             }
-            apply_sampling_params(payload["sampling_params"], request_func_input, always_top_p=False)
-            headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+            apply_sampling_params(
+                payload["sampling_params"], request_func_input, always_top_p=False
+            )
+            headers = _build_http_request_headers(
+                request_func_input,
+                {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"},
+            )
 
             output = RequestFuncOutput()
             output.prompt_len = request_func_input.prompt_len
@@ -717,7 +1648,10 @@ async def async_request_cserve_debug(
                 print_verbose(idx, request_func_input, st, 0, 0, True)
             try:
                 async with session.post(
-                    url=api_url, json=payload, headers=headers, ssl=request_func_input.ssl
+                    url=api_url,
+                    json=payload,
+                    headers=headers,
+                    ssl=request_func_input.ssl,
                 ) as response:
                     if response.status == 200:
                         parsed_resp = await response.json()
@@ -726,12 +1660,17 @@ async def async_request_cserve_debug(
                         output.generated_text = parsed_resp["text"][0]
                         output.success = True
                         if verbose:
-                            print_verbose(idx, request_func_input, 0, rcv_time, output.latency, False)
+                            print_verbose(
+                                idx,
+                                request_func_input,
+                                0,
+                                rcv_time,
+                                output.latency,
+                                False,
+                            )
                     else:
                         output.success = False
-                        output.error = (
-                            f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
-                        )
+                        output.error = f"There was an error reaching the endpoint. Error code: {response.status} {response.reason}"
 
             except aiohttp.ClientConnectorError:
                 output.success = False
@@ -755,7 +1694,12 @@ def remove_prefix(text: str, prefix: str) -> str:
 
 
 def print_verbose(
-    idx: int, request_func_input: RequestFuncInput, send_time: float, rcv_time: float, latency: float, sending: bool
+    idx: int,
+    request_func_input: RequestFuncInput,
+    send_time: float,
+    rcv_time: float,
+    latency: float,
+    sending: bool,
 ) -> None:
     if sending:
         print(
@@ -775,14 +1719,18 @@ def print_verbose(
 
 
 async def async_request_profiler(
-    idx: int, request_func_input: RequestFuncInput, pbar: Optional[tqdm], verbose: bool, wait_time: float
+    idx: int,
+    request_func_input: RequestFuncInput,
+    pbar: Optional[tqdm],
+    verbose: bool,
+    wait_time: float,
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
-    assert api_url.endswith("start_profile") or api_url.endswith(
-        "stop_profile"
-    ), "Torch Profiler API URL must end with 'start_profile' or 'stop_profile'."
+    assert api_url.endswith("start_profile") or api_url.endswith("stop_profile"), (
+        "Torch Profiler API URL must end with 'start_profile' or 'stop_profile'."
+    )
 
-    async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
+    async with _HttpSessionContext(request_func_input) as session:
         payload = {
             "model": request_func_input.model,
             "messages": [],
@@ -794,14 +1742,23 @@ async def async_request_profiler(
         if request_func_input.logprobs is not None:
             payload["logprobs"] = True
             payload["top_logprobs"] = int(request_func_input.logprobs)
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+        headers = _build_http_request_headers(
+            request_func_input,
+            {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
+            },
+        )
 
         output = RequestFuncOutput()
         output.prompt_len = request_func_input.prompt_len
 
         try:
             async with session.post(
-                url=api_url, json=payload, headers=headers, verify_ssl=request_func_input.ssl
+                url=api_url,
+                json=payload,
+                headers=headers,
+                verify_ssl=request_func_input.ssl,
             ) as response:
                 if response.status == 200:
                     output.success = True
@@ -833,6 +1790,9 @@ ASYNC_REQUEST_FUNCS = {
     "deepspeed-mii": async_request_deepspeed_mii,
     "openai": async_request_openai_completions,
     "openai-chat": async_request_openai_chat_completions,
+    "openai-grpc": async_request_openai_grpc_completions,
+    "vllm-grpc": async_request_openai_grpc_completions,
+    "openai-chat-grpc": async_request_openai_grpc_chat_completions,
     "tensorrt-llm": async_request_trt_llm,
     "profiler": async_request_profiler,
 }
