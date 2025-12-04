@@ -79,7 +79,9 @@ CURRENT=0
 # Function to get concurrency level from test name
 get_concurrency_level() {
     local test_name=$1
-    case $test_name in
+    # Strip -eager or -lazy suffix if present
+    local base_name=$(echo "$test_name" | sed 's/-eager$//' | sed 's/-lazy$//')
+    case $base_name in
         "concurrency-low") echo "2" ;;
         "concurrency-medium") echo "10" ;;
         "concurrency-high") echo "25" ;;
